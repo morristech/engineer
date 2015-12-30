@@ -15,7 +15,7 @@ Environment Example
   },
 	"Apps": {
 		"environ": {
-			"Executable": "engineer/examples/environ",
+			"Executable": "github.com/pushbullet/engineer/examples/environ",
 			"Tags": ["http-server"]
 		}
 	}

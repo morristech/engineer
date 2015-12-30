@@ -24,15 +24,12 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/fsnotify.v1"
-
 	"engineer"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	rawstorage "google.golang.org/api/storage/v1"
 	"google.golang.org/cloud"
@@ -406,7 +403,7 @@ func getInstanceStatus(instanceName string) (*Status, error) {
 }
 
 func uploadAgent() {
-	path, err := buildExecutable("engineer/agent", false)
+	path, err := buildExecutable("github.com/pushbullet/engineer/agent", false)
 	V(err)
 
 	r, err := os.Open(path)

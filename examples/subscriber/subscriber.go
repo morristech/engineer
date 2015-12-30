@@ -15,7 +15,7 @@ Subscriber Example
   },
 	"Apps": {
 		"subscriber": {
-			"Executable": "engineer/examples/subscriber",
+			"Executable": "github.com/pushbullet/engineer/examples/subscriber",
 			"Scopes": ["https://www.googleapis.com/auth/pubsub"],
 			"Worker": true
 		}

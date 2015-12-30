@@ -15,7 +15,7 @@ Publisher Example
   },
 	"Apps": {
 		"publisher": {
-			"Executable": "engineer/examples/publisher",
+			"Executable": "github.com/pushbullet/engineer/examples/publisher",
 			"Scopes": ["https://www.googleapis.com/auth/pubsub"],
 			"Tags": ["http-server"]
 		}

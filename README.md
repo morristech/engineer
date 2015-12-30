@@ -46,11 +46,11 @@ The `engr` command line tool uses your `gcloud auth` credentials, so make sure y
   },
   "Apps": {
     "environ": {
-      "Executable": "pushbullet.com/engineer/examples/environ",
+      "Executable": "github.com/pushbullet/engineer/examples/environ",
       "Tags": ["http-server"]
     },
 		"scheduler": {
-			"Executable": "pushbullet.com/engineer/examples/scheduler",
+			"Executable": "github.com/pushbullet/engineer/examples/scheduler",
       "Scopes": ["https://www.googleapis.com/auth/pubsub"],
 			"Worker": true
 		}

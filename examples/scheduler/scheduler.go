@@ -15,7 +15,7 @@ Scheduler Example
   },
 	"Apps": {
 		"scheduler": {
-			"Executable": "engineer/examples/scheduler",
+			"Executable": "github.com/pushbullet/engineer/examples/scheduler",
       "Scopes": ["https://www.googleapis.com/auth/pubsub"],
 			"Worker": true
 		}
