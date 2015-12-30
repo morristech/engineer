@@ -18,13 +18,13 @@ Apps must be a single Go executables and are run directly on GCE instances with 
 
 ## Features
 * inspired by heroku + http://12factor.net/
-* go only
+* Go only
 * depends on GCE and GCS
 * deploys, rollbacks, and environment changes are quick (~10s with fast internet connection)
 * other operations (such as sync) are slow (~3m)
 * with fancy deploys, you can not interrupt existing requests (`"GracefulShutdown": true` in `engr.json`)
-* cgo will not work because of cross-compilation (for fast deploys)
-* each app gets its own gcs bucket and 1 or more VMs, so each app requires at least an f1-micro instance
+* cgo will not work because of cross-compilation (for fast/serverless deploys)
+* each app gets its own gcs bucket and 1 or more VMs, so each app requires at least an f1-micro instance (but those are pretty cheap)
 * no stub services, just uses actual google services
 
 ## Current Limitations that may be removed later
@@ -37,7 +37,7 @@ Apps must be a single Go executables and are run directly on GCE instances with 
 The `engr` command line tool uses your `gcloud auth` credentials, so make sure you have run `gcloud auth login` https://cloud.google.com/sdk/gcloud/ and that you have the correct account active (`gcloud auth list`).
 
 ## Basic Operation
-0. Create an `engr.json` file that describes how you want your apps setup.
+Create an `engr.json` file that describes how you want your apps setup.
 ```json
 {
   "Deployments": {
@@ -60,7 +60,8 @@ The `engr` command line tool uses your `gcloud auth` credentials, so make sure y
 }
 ```
 Without the proper tags + firewall rules, your instances will not be able to receive incoming connections. The `"Worker": true` property means that the app does not require a load balancer since it won't be receiving any traffic.
-0. Commands work like this: `engr <deployment> <app> <command>`, try `engr dev environ deploy` and `engr dev environ status`
+
+Commands work like this: `engr <deployment> <app> <command>`, try `engr dev environ deploy` and `engr dev environ status`
 
 ## Commands
 * serve - runs the app on the local machine with the remote environment of the app
