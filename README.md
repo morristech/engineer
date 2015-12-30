@@ -33,7 +33,12 @@ Apps must be a single Go executables and are run directly on GCE instances with 
 * `engr` probably only runs on Mac
 
 # Getting Started
+## Installation
+0. go get github.com/pushbullet/engineer
+0. go get github.com/pushbullet/engineer/engr
+
 ## Authentication
+
 The `engr` command line tool uses your `gcloud auth` credentials, so make sure you have run `gcloud auth login` https://cloud.google.com/sdk/gcloud/ and that you have the correct account active (`gcloud auth list`).
 
 ## Basic Operation
