@@ -1,6 +1,6 @@
 # engineer
 
-Experimental client-side deployment tool for Go on Google Cloud Platform.  Like App Engine but lower level and on GCE.
+Experimental client-side deployment tool for Go on Google Cloud Platform.  Vaguely similar to App Engine but lower level and on GCE.
 
 Composed of 3 parts:
 0. `engr` command line tool to create instance groups on GCE and deploy new versions of apps.
