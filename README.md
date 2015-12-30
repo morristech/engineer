@@ -72,6 +72,7 @@ Without the proper tags + firewall rules, your instances will not be able to rec
 * setenv <key> <value> - sets the value of a key to the provided string, value can be "@<filename>" to get the value from a file or "" to unset the key (this command will cause a new version to be deployed)
 * destroy - destroys all resources for the app
 * run - run a script on the local machine with the remote environment of the app
+* logs - open a browser window to show the logs for this app
 
 # Known Issues
 * If multiple people try to run deploys at the same time it will totally break because there is no locking
