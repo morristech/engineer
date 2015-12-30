@@ -116,8 +116,10 @@ NOTE: For this process to work, the app must bind the socket with the `SO_REUSEP
 
 ### Server
 0. Catch the `SIGTERM` signal so your app doesn't die
-0. Stop listening for traffic (if using `engineer.ListenAndServe()`, this will happen automatically and `ListenAndServe` will return)
+0. Stop listening for traffic
 0. Exit when requests are complete (ideally within 60 seconds in case instance is shutting down)
+
+NOTE: `engineer.ListenAndServe()` does steps 1 and 2
 
 ### Worker
 0. Catch the `SIGTERM` signal so your app doesn't die
