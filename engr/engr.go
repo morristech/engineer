@@ -24,12 +24,14 @@ import (
 	"syscall"
 	"time"
 
-	"engineer"
+	"gopkg.in/fsnotify.v1"
 
+	"github.com/pushbullet/engineer"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	rawstorage "google.golang.org/api/storage/v1"
 	"google.golang.org/cloud"
@@ -37,7 +39,7 @@ import (
 )
 
 const (
-	agentVersion = 9
+	agentVersion = 11
 )
 
 var sshKeyPath string
@@ -703,7 +705,7 @@ func appCommand(command string, args []string) {
 	}
 	bucketExists := err == nil
 
-	if command != "deploy" && command != "destroy" {
+	if command != "deploy" && command != "destroy" && command != "logs" {
 		if !bucketExists {
 			exitf("missing app bucket name=%s", inst.Bucket())
 		}
@@ -749,6 +751,8 @@ func appCommand(command string, args []string) {
 		syncResources(inst)
 	case "serve":
 		serve()
+	case "logs":
+		V(exec.Command("open", fmt.Sprintf("https://console.developers.google.com/logs?project=%s&service=custom.googleapis.com&key1=%s", inst.Deployment.Project, inst.App.Name)).Run())
 	case "status":
 		infof("app:%s", inst.App.Name)
 		state, err := engineer.GetState(ctx, inst.Bucket())
@@ -1101,6 +1105,7 @@ Command must be one of:
     this command will cause a new version to be deployed
 	destroy - destroys all resources for the app
 	run - run a script on the local machine with the environment of the app
+	logs - open a browser window to show the logs for this app
 
 Global commands:
 Usage: engr <deployment> <command> [options]

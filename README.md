@@ -3,6 +3,7 @@
 Experimental client-side deployment tool for Go on Google Cloud Platform.  Vaguely similar to App Engine but lower level and on GCE.
 
 Composed of 3 parts:
+
 0. `engr` command line tool to create instance groups on GCE and deploy new versions of apps.
 0. `engineer` library (has a few environment variables defined + some graceful shutdown socket stuff)
 0. agent that runs on the GCE instance, handles stdout/stderr logging and restarts the app if it dies
@@ -29,6 +30,7 @@ Apps must be a single Go executables and are run directly on GCE instances with 
 ## Current Limitations that may be removed later
 * Manual scaling only
 * An app is only the go executable, no external resources are copied
+* `engr` probably only runs on Mac
 
 # Getting Started
 ## Authentication

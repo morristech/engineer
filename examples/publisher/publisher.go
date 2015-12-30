@@ -24,23 +24,21 @@ Publisher Example
 
 2. Find the IP address by using "engr dev publisher status"
 3. Run "curl http://<ip address>/" and a new message should be published to the topic "engr-test-topic"
-4. Check the cloud console logs for your project.  View the logs for "Custom Logs"
-		and you should see the logs for this module whenever you make a request
+4. View the logs with "engr dev publisher logs" and you should see the logs for this app whenever you make a request
 5. Deploy the subscriber example to consume these messages.
 6. Run "engr dev publisher destroy" to remove all created resources
 
 */
 
 import (
-	"engineer"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 
+	"github.com/pushbullet/engineer"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
-
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/pubsub"
 )

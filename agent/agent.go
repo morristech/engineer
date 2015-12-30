@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pushbullet/engineer"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -27,8 +28,6 @@ import (
 	"google.golang.org/cloud/compute/metadata"
 	"google.golang.org/cloud/logging"
 	"google.golang.org/cloud/storage"
-
-	"engineer"
 )
 
 var (
@@ -526,10 +525,10 @@ func main() {
 			0644,
 		)
 		Run("sysctl -w fs.file-max=1048576")
-		if code := RunWithExit(fmt.Sprintf("groupadd -g %d agent", agentUID)); code != 0 && code != 9 {
+		if code := RunWithExit(fmt.Sprintf("groupadd -g %d app", appUID)); code != 0 && code != 9 {
 			fatal("failed to create group")
 		}
-		if code := RunWithExit(fmt.Sprintf("useradd -r agent -u %d -g %d", agentUID, agentUID)); code != 0 && code != 9 {
+		if code := RunWithExit(fmt.Sprintf("useradd -r app -u %d -g %d", appUID, appUID)); code != 0 && code != 9 {
 			fatal("failed to create user")
 		}
 
@@ -549,7 +548,7 @@ func main() {
 	Restart=always
 	RestartSec=30
 	LimitNOFILE=1048576
-	User=agent
+	User=app
 	KillMode=process
 	TimeoutStopSec=95s
 

@@ -22,22 +22,20 @@ Scheduler Example
 	}
 }
 
-2. Check the cloud console logs for your project.  View the logs for "Custom Logs"
-		and you should see the logs for this module as it publishes a new message every 5 seconds
+2. View the logs with "engr dev scheduler logs" and you should see the logs for this app as it publishes a new message every 5 seconds
 3. Run "engr dev scheduler destroy" to remove all created resources
 
 */
 
 import (
 	"encoding/json"
-	"engineer"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/pushbullet/engineer"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
-
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/pubsub"
 )

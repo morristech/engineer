@@ -24,23 +24,21 @@ Subscriber Example
 
 2. Deploy the publisher module to create messages.
 3. Run "curl http://<ip address>/" with the ip address of the publisher module
-3. Check the cloud console logs for your project.  View the logs for "Custom Logs"
-		and you should see the logs for this module whenever it receives a published message
-4. Run "engr dev subscriber destroy" to remove all created resources
+4. View the logs with "engr dev subscriber logs" and you should see the logs for this app whenever it receives a published message
+5. Run "engr dev subscriber destroy" to remove all created resources
 
 */
 
 import (
-	"engineer"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/pushbullet/engineer"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
-
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/pubsub"
 )
