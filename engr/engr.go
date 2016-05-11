@@ -4,19 +4,14 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,25 +21,20 @@ import (
 
 	"gopkg.in/fsnotify.v1"
 
-	"github.com/pushbullet/engineer"
-	"golang.org/x/crypto/ssh"
+	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	rawpubsub "google.golang.org/api/pubsub/v1"
 	rawstorage "google.golang.org/api/storage/v1"
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/storage"
 )
 
-const (
-	agentVersion = 11
-)
-
-var sshKeyPath string
-var inst Install
 var ctx context.Context
+var gcps *rawpubsub.Service
 var gcs *rawstorage.Service
 var gce *compute.Service
 var storageClient *storage.Client
@@ -59,62 +49,16 @@ const (
 	Reset  = "\x1b[0m"
 )
 
+type Command struct {
+	Name string
+	Args []string
+
+	App               internal.App
+	AppBucketRequired bool
+}
+
 type Config struct {
-	Deployments map[string]engineer.Deployment
-	Apps        map[string]engineer.App
-}
-
-type Install struct {
-	App        engineer.App
-	Deployment engineer.Deployment
-}
-
-func (i *Install) TargetPool() string {
-	return fmt.Sprintf("%s-%s-pool", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) Address() string {
-	return fmt.Sprintf("%s-%s-address", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) ForwardingRule() string {
-	return fmt.Sprintf("%s-%s-rule", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) HealthCheck() string {
-	return fmt.Sprintf("%s-%s-check", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) InstanceGroup() string {
-	return fmt.Sprintf("%s-%s-group", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) TemplateBase() string {
-	return fmt.Sprintf("%s-%s-template", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) InstanceBase() string {
-	return fmt.Sprintf("%s-%s", i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) Bucket() string {
-	return fmt.Sprintf("%s-%s-%s", i.Deployment.Project, i.Deployment.Name, i.App.Name)
-}
-
-func (i *Install) DeploymentConfig() engineer.DeploymentConfig {
-	dc := i.App.DeploymentConfig[i.Deployment.Name]
-	if dc.MachineType == "" {
-		dc.MachineType = "f1-micro"
-	}
-	if dc.InstanceCount == 0 {
-		dc.InstanceCount = 1
-	}
-	return dc
-}
-
-func RegionFromZone(zone string) string {
-	parts := strings.Split(zone, "-")
-	return strings.Join(parts[:len(parts)-1], "-")
+	Apps map[string]internal.App `json:"apps"`
 }
 
 func infof(f string, args ...interface{}) {
@@ -148,7 +92,7 @@ func exitf(f string, args ...interface{}) {
 
 func V(err error) {
 	if err != nil {
-		exitf(err.Error())
+		panic(err)
 	}
 }
 
@@ -162,18 +106,58 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.0fs", d.Seconds())
 }
 
-func buildExecutable(pkg string, local bool) (string, error) {
-	infof("building executable pkg=%s", pkg)
-	tmpDir, err := ioutil.TempDir("", "")
+func findGOPATH() (string, error) {
+	gopath := ""
+	// get gopath from go tool
+	output, err := exec.Command("go", "env").CombinedOutput()
 	if err != nil {
 		return "", err
 	}
-	outputPath := filepath.Join(tmpDir, filepath.Base(pkg))
-	cmd := exec.Command("go", "build", "-i", "-o", outputPath, pkg)
-	cmd.Env = os.Environ()
+	for _, part := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(part, "GOPATH=") {
+			gopath = part[8 : len(part)-1]
+			break
+		}
+	}
+
+	if gopath == "" {
+		return "", errors.New("could not determine GOPATH")
+	}
+	return gopath, nil
+}
+
+func buildExecutable(app internal.App, local bool) (string, error) {
+	// figure out gopath based on output from go env
+	// we need gopath to figure out where the binaries will end up because we use go install
+	// we use go install because it's much faster than go build
+	gopath, err := findGOPATH()
+	if err != nil {
+		return "", err
+	}
+
+	pkg := app.Package
+	if app.Generate {
+		infof("running go generate")
+		cmd := exec.Command("go", "generate", pkg)
+		cmd.Env = []string{"GOPATH=" + gopath, "PATH=" + os.Getenv("PATH")}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			errorf("generate error=%v output=%s", err, output)
+			return "", err
+		}
+	}
+
+	infof("installing package=%s", pkg)
+
+	cmd := exec.Command("go", "install", pkg)
+	cmd.Env = []string{"GOPATH=" + gopath}
+	outputPath := filepath.Join(gopath, "bin", filepath.Base(pkg))
+
 	if !local {
 		cmd.Env = append(cmd.Env, "GOOS=linux", "GOARCH=amd64")
+		outputPath = filepath.Join(gopath, "bin", "linux_amd64", filepath.Base(pkg))
 	}
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		errorf("build error=%v output=%s", err, output)
@@ -182,43 +166,52 @@ func buildExecutable(pkg string, local bool) (string, error) {
 	return outputPath, nil
 }
 
-func runApp() chan bool {
+func runApp(app internal.App) chan bool {
 	restart := make(chan bool)
 
 	startApp := func() (*exec.Cmd, error) {
-		path, err := buildExecutable(inst.App.Executable, true)
+		path, err := buildExecutable(app, true)
 		if err != nil {
 			return nil, err
 		}
 
 		environment := []string{
-			"ENGR_APP=" + inst.App.Name,
+			"ENGR_APP=" + app.Name,
 			"ENGR_VERSION=0",
-			"ENGR_PROJECT=" + inst.Deployment.Project,
+			"ENGR_PROJECT=" + app.Project,
 			"ENGR_DEVELOPMENT=1",
-			"GOOGLE_APPLICATION_CREDENTIALS=" + os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 		}
 
-		env := map[string]string{}
-		state, err := engineer.GetState(ctx, inst.Bucket())
+		if app.Local {
+			environment = append(environment, os.Environ()...)
+		} else {
+			env := map[string]string{}
+			state, err := getState(ctx, app.Bucket())
+			if err != nil {
+				return nil, err
+			}
+			if state.Version == 0 {
+				exitf("no version deployed yet")
+			}
+
+			env, err = getEnv(app, state.Version)
+			if err != nil {
+				return nil, err
+			}
+
+			for k, v := range env {
+				environment = append(environment, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+
+		tmpDir, err := ioutil.TempDir("", "")
 		if err != nil {
 			return nil, err
-		}
-		if state.Version == 0 {
-			exitf("no version deployed yet")
-		}
-
-		env, err = getEnv(state.Version)
-		if err != nil {
-			return nil, err
-		}
-
-		for k, v := range env {
-			environment = append(environment, fmt.Sprintf("%s=%s", k, v))
 		}
 
 		cmd := &exec.Cmd{
 			Path: path,
+			Dir:  tmpDir,
 			Env:  environment,
 		}
 
@@ -230,7 +223,7 @@ func runApp() chan bool {
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				fmt.Printf(Green + "[" + inst.App.Name + "] " + scanner.Text() + Reset + "\n")
+				fmt.Printf(Green + "[" + app.Name + "] " + scanner.Text() + Reset + "\n")
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -239,14 +232,14 @@ func runApp() chan bool {
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				fmt.Printf(Red + "[" + inst.App.Name + "] ERROR: " + scanner.Text() + Reset + "\n")
+				fmt.Printf(Red + "[" + app.Name + "] ERROR: " + scanner.Text() + Reset + "\n")
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
 			}
 		}()
 
-		infof("starting app name=%s", inst.App.Name)
+		infof("starting app name=%s", app.Name)
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
@@ -267,6 +260,7 @@ func runApp() chan bool {
 
 				if err := cmd.Wait(); err != nil && err.Error() != "signal: killed" {
 					errorf("process exited abnormally: err=%v", err)
+					time.Sleep(1 * time.Second)
 				}
 			} else {
 				errorf("failed to start process err=%v", err)
@@ -278,7 +272,7 @@ func runApp() chan bool {
 	return restart
 }
 
-func serve() {
+func serve(app internal.App) {
 	showLogPrefix = true
 
 	var (
@@ -351,9 +345,8 @@ func serve() {
 
 	V(filepath.Walk(".", visit))
 
-	ignorePaths := map[string]bool{"tags": true}
 	shouldRestart := false
-	restartChan := runApp()
+	restartChan := runApp(app)
 
 	for {
 		changedFilesLock.Lock()
@@ -362,11 +355,9 @@ func serve() {
 		changedFilesLock.Unlock()
 
 		for _, path := range lastChangedFiles {
-			if !ignorePaths[path] {
-				infof("file changed path=%s", path)
-				shouldRestart = true
-				break
-			}
+			infof("file changed path=%s", path)
+			shouldRestart = true
+			break
 		}
 
 		if shouldRestart {
@@ -377,139 +368,46 @@ func serve() {
 	}
 }
 
-type Status struct {
-	InstanceUptime time.Duration
-	AppUptime      time.Duration
-	AppVersion     int
+type State struct {
+	Version int
 }
 
-func getInstanceStatus(instanceName string) (*Status, error) {
-	client, err := createSSHClient(ipForInstance(instanceName), 5*time.Second)
+func getState(c context.Context, bucket string) (*State, error) {
+	client, err := storage.NewClient(c)
 	if err != nil {
 		return nil, err
 	}
-	session, err := client.NewSession()
+	defer client.Close()
+	r, err := client.Bucket(bucket).Object("state.json").NewReader(c)
 	if err != nil {
 		return nil, err
 	}
-	defer session.Close()
-	output, err := session.CombinedOutput("/agent/agent status")
+	state := &State{}
+	if err := json.NewDecoder(r).Decode(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func putState(c context.Context, bucket string, state *State) error {
+	client, err := storage.NewClient(c)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	status := &Status{}
-	if err := json.Unmarshal(output, status); err != nil {
-		return nil, err
+	defer client.Close()
+	w := client.Bucket(bucket).Object("state.json").NewWriter(c)
+	if err := json.NewEncoder(w).Encode(state); err != nil {
+		return err
 	}
-	return status, nil
+	return w.Close()
 }
 
-func uploadAgent() {
-	path, err := buildExecutable("github.com/pushbullet/engineer/agent", false)
+func getInstances(app internal.App, name string) []string {
+	result, err := gce.InstanceGroupManagers.ListManagedInstances(app.Project, app.Zone, name).Do()
 	V(err)
-
-	r, err := os.Open(path)
-	V(err)
-	gcsWrite("agent", r)
-	V(r.Close())
-}
-
-func deployVersion() {
-	path, err := buildExecutable(inst.App.Executable, false)
-	V(err)
-
-	infof("getting state")
-	state, err := engineer.GetState(ctx, inst.Bucket())
-	V(err)
-	state.Version++
-
-	infof("uploading files")
-	buf := &bytes.Buffer{}
-	zw := zip.NewWriter(buf)
-	fw, err := zw.Create(filepath.Base(inst.App.Executable))
-	V(err)
-	r, err := os.Open(path)
-	V(err)
-	_, err = io.Copy(fw, r)
-	V(err)
-
-	V(zw.Close())
-	gcsVersionWrite(state.Version, "package.zip", buf)
-
-	if state.Version == 1 {
-		gcsVersionWrite(state.Version, "env.json", strings.NewReader("{}"))
-	} else {
-		gcsVersionCopy(state.Version-1, state.Version, "env.json")
-	}
-
-	{
-		j, err := json.Marshal(inst.App)
-		V(err)
-		gcsVersionWrite(state.Version, "app.json", bytes.NewReader(j))
-	}
-
-	infof("updating state")
-	V(engineer.PutState(ctx, inst.Bucket(), state))
-
-	infof("updating instances")
-	sshInstances(getInstances(), "update")
-	infof("deployed version=%d", state.Version)
-
-	if state.Version == 1 {
-		infof("running sync automatically for first deploy")
-		syncResources(inst)
-	}
-}
-
-func ipForInstance(instance string) string {
-	resp, err := gce.Instances.Get(inst.Deployment.Project, inst.Deployment.Zone, instance).Do()
-	V(err)
-	return resp.NetworkInterfaces[0].AccessConfigs[0].NatIP
-}
-
-func sshInstances(instances []string, command string) {
-	for _, instance := range instances {
-		sshCommand(lastPathComponent(instance), "/agent/agent "+command)
-	}
-}
-
-func wait(originalOp *compute.Operation, err error) {
-	project := inst.Deployment.Project
-	zone := inst.Deployment.Zone
-	region := RegionFromZone(inst.Deployment.Zone)
-
-	V(err)
-	for {
-		var op *compute.Operation
-		var err error
-		if originalOp.Zone != "" {
-			op, err = gce.ZoneOperations.Get(project, zone, originalOp.Name).Do()
-		} else if originalOp.Region != "" {
-			op, err = gce.RegionOperations.Get(project, region, originalOp.Name).Do()
-		} else {
-			op, err = gce.GlobalOperations.Get(project, originalOp.Name).Do()
-		}
-		V(err)
-		if op.Status == "DONE" {
-			if op.Error != nil {
-				for _, e := range op.Error.Errors {
-					errorf("%s", e.Message)
-				}
-				os.Exit(1)
-			}
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-func getInstances() []string {
-	resp, err := gce.Instances.List(inst.Deployment.Project, inst.Deployment.Zone).Filter(fmt.Sprintf("name eq '%s-[a-z0-9]{4}'", inst.InstanceBase())).Do()
-	V(err)
-
 	instances := []string{}
-	for _, item := range resp.Items {
-		instances = append(instances, item.Name)
+	for _, instance := range result.ManagedInstances {
+		instances = append(instances, lastComponent(instance.Instance, "/"))
 	}
 	return instances
 }
@@ -523,141 +421,53 @@ func is404Error(err error) bool {
 	return false
 }
 
-func gcsWriter(name string) *storage.Writer {
-	return storageClient.Bucket(inst.Bucket()).Object(name).NewWriter(ctx)
+func gcsWriter(app internal.App, name string) *storage.Writer {
+	return storageClient.Bucket(app.Bucket()).Object(name).NewWriter(ctx)
 }
 
-func gcsVersionCopy(oldVersion int, newVersion int, name string) {
-	src := strconv.Itoa(oldVersion) + "/" + name
-	dst := strconv.Itoa(newVersion) + "/" + name
-	infof("copying gcs file src=gs://%s/%s dst=gs://%s/%s", inst.Bucket(), src, inst.Bucket(), dst)
-	_, err := storageClient.CopyObject(ctx, inst.Bucket(), src, inst.Bucket(), dst, nil)
-	V(err)
-}
-
-func gcsWrite(name string, r io.Reader) {
+func gcsVersionCopy(app internal.App, oldVersion int, newVersion int, name string) {
+	srcName := strconv.Itoa(oldVersion) + "/" + name
+	src := storageClient.Bucket(app.Bucket()).Object(srcName)
+	dstName := strconv.Itoa(newVersion) + "/" + name
+	dst := storageClient.Bucket(app.Bucket()).Object(dstName)
 	start := time.Now()
-	w := gcsWriter(name)
+	_, err := src.CopyTo(ctx, dst, nil)
+	V(err)
+	infof("copied gcs file src=gs://%s/%s dst=gs://%s/%s in %.2fs", app.Bucket(), srcName, app.Bucket(), dstName, time.Now().Sub(start).Seconds())
+}
+
+func gcsWrite(app internal.App, name string, r io.Reader) {
+	start := time.Now()
+	w := gcsWriter(app, name)
 	n, err := io.Copy(w, r)
 	V(err)
 	V(w.Close())
-	infof("wrote gcs file path=gs://%s/%s %d bytes in %.2fs", inst.Bucket(), name, n, time.Now().Sub(start).Seconds())
+	infof("wrote gcs file path=gs://%s/%s %d bytes in %.2fs", app.Bucket(), name, n, time.Now().Sub(start).Seconds())
 }
 
-func gcsVersionWrite(version int, name string, r io.Reader) {
-	gcsWrite(strconv.Itoa(version)+"/"+name, r)
+func gcsVersionWrite(app internal.App, version int, name string, r io.Reader) {
+	gcsWrite(app, strconv.Itoa(version)+"/"+name, r)
 }
 
-func gcsDelete(name string) {
-	infof("deleting gcs file path=gs://%s/%s", inst.Bucket(), name)
-	err := storageClient.Bucket(inst.Bucket()).Object(name).Delete(ctx)
+func gcsVersionRead(app internal.App, version int, name string) []byte {
+	r, err := storageClient.Bucket(app.Bucket()).Object(strconv.Itoa(version) + "/" + name).NewReader(ctx)
+	V(err)
+	contents, err := ioutil.ReadAll(r)
+	V(err)
+	return contents
+}
+
+func gcsDelete(app internal.App, name string) {
+	infof("deleting gcs file path=gs://%s/%s", app.Bucket(), name)
+	err := storageClient.Bucket(app.Bucket()).Object(name).Delete(ctx)
 	if is404Error(err) {
 		return
 	}
 	V(err)
 }
 
-func createSSHClient(ipAddress string, timeout time.Duration) (*ssh.Client, error) {
-	u, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-	sshKeyPath := u.HomeDir + "/.ssh/engineer-" + inst.Deployment.Project
-
-	if _, err := os.Stat(sshKeyPath); os.IsNotExist(err) {
-		// generate a new key and add it to the metadata
-		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			return nil, err
-		}
-		block := pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-		}
-		V(ioutil.WriteFile(sshKeyPath, pem.EncodeToMemory(&block), 0600))
-
-		sshPublicKey, err := ssh.NewPublicKey(privateKey.Public())
-		if err != nil {
-			return nil, err
-		}
-		auth := ssh.MarshalAuthorizedKey(sshPublicKey)
-
-		if err := ioutil.WriteFile(sshKeyPath+".pub", auth, 0644); err != nil {
-			return nil, err
-		}
-
-		prj, err := gce.Projects.Get(inst.Deployment.Project).Do()
-		if err != nil {
-			return nil, err
-		}
-
-		key := "root:" + string(auth)
-		found := false
-		for _, item := range prj.CommonInstanceMetadata.Items {
-			if item.Key == "sshKeys" {
-				found = true
-				keys := strings.Split(strings.TrimSpace(*item.Value), "\n")
-				v := strings.Join(append(keys, key), "\n")
-				item.Value = &v
-				break
-			}
-		}
-
-		if !found {
-			prj.CommonInstanceMetadata.Items = append(prj.CommonInstanceMetadata.Items, &compute.MetadataItems{Key: "sshKeys", Value: &key})
-		}
-
-		wait(gce.Projects.SetCommonInstanceMetadata(inst.Deployment.Project, prj.CommonInstanceMetadata).Do())
-	}
-
-	keyBytes, err := ioutil.ReadFile(sshKeyPath)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	config := &ssh.ClientConfig{
-		User: "root",
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-	}
-
-	conn, err := net.DialTimeout("tcp", ipAddress+":22", timeout)
-	if err != nil {
-		return nil, err
-	}
-
-	c, chans, reqs, err := ssh.NewClientConn(conn, ipAddress+":22", config)
-	if err != nil {
-		return nil, err
-	}
-
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
-func sshCommand(instance string, command string) {
-	infof("running ssh command %s: %s", instance, command)
-
-	client, err := createSSHClient(ipForInstance(instance), 5*time.Second)
-	V(err)
-	session, err := client.NewSession()
-	V(err)
-	defer session.Close()
-
-	output, err := session.CombinedOutput(command)
-	if err != nil {
-		errorf("ssh output: %s", output)
-	}
-	V(err)
-}
-
-func getEnv(version int) (map[string]string, error) {
-	r, err := storageClient.Bucket(inst.Bucket()).Object(strconv.Itoa(version) + "/env.json").NewReader(ctx)
+func getEnv(app internal.App, version int) (map[string]string, error) {
+	r, err := storageClient.Bucket(app.Bucket()).Object(strconv.Itoa(version) + "/env.json").NewReader(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -668,59 +478,105 @@ func getEnv(version int) (map[string]string, error) {
 	return env, nil
 }
 
-func printEnv(env map[string]string) {
-	for k, v := range env {
-		fmt.Printf("  %s=%s\n", k, v)
-	}
-}
-
-func RPartition(s string, sep string) (string, string) {
-	i := strings.LastIndex(s, sep)
-	if i == -1 {
-		return s, ""
-	}
-	return s[:i], s[i+len(sep):]
-}
-
-func putEnv(version int, env map[string]string) {
+func putEnv(app internal.App, version int, env map[string]string) {
 	j, err := json.Marshal(env)
 	V(err)
-	gcsVersionWrite(version, "env.json", bytes.NewReader(j))
+	gcsVersionWrite(app, version, "env.json", bytes.NewReader(j))
 }
 
-func lastPathComponent(u string) string {
-	_, name := RPartition(u, "/")
-	if name == "" {
+func lastComponent(u string, sep string) string {
+	parts := strings.Split(u, sep)
+	last := parts[len(parts)-1]
+	if last == "" {
 		return u
 	} else {
-		return name
+		return last
 	}
 }
 
-func appCommand(command string, args []string) {
-	bucket := storageClient.Bucket(inst.Bucket())
+func exists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+		V(err)
+	}
+	return true
+}
+
+func readConfig() Config {
+	config := Config{}
+	contents, err := ioutil.ReadFile("engr.json")
+	if err != nil {
+		exitf("could not read engr.json")
+	}
+
+	if err := json.Unmarshal(contents, &config); err != nil {
+		exitf("could not parse engr.json")
+	}
+	return config
+}
+
+func writeConfig(config Config) {
+	contents, err := json.MarshalIndent(config, "", "  ")
+	V(err)
+
+	V(ioutil.WriteFile("engr.json", contents, 0644))
+}
+
+func runCommand(cmd Command) {
+	app := cmd.App
+	bucket := storageClient.Bucket(app.Bucket())
 	_, err := bucket.Attrs(ctx)
 	if err != nil && err != storage.ErrBucketNotExist {
 		V(err)
 	}
 	bucketExists := err == nil
 
-	if command != "deploy" && command != "destroy" && command != "logs" {
-		if !bucketExists {
-			exitf("missing app bucket name=%s", inst.Bucket())
+	if !app.StagedDeploy {
+		switch cmd.Name {
+		case "deploy", "env:set", "env:unset", "status", "rollback":
+			// prepare an RPC subscription for these commands
+			go PrepareRPC(ctx, app.Name)
 		}
 	}
 
-	switch command {
-	case "destroy":
-		infof("destroying deployment=%s app=%s", inst.Deployment.Name, inst.App.Name)
+	if cmd.AppBucketRequired {
+		if !bucketExists {
+			exitf("missing app bucket name=%s", app.Bucket())
+		}
+	}
 
-		deleteResources(inst, listResources(inst))
+	switch cmd.Name {
+	case "destroy-app":
+		if !ask("destroy app "+app.Name+"?", false) {
+			return
+		}
 
-		// if bucket exists, delete all items then delete the bucket
+		infof("destroying app=%s", app.Name)
+
+		igms, err := gce.InstanceGroupManagers.List(app.Project, app.Zone).Filter(fmt.Sprintf(`name eq '%s-group.*'`, app.Name)).Do()
+		V(err)
+		for _, igm := range igms.Items {
+			infof("destroying instance group name=%s", igm.Name)
+			wait(gce.InstanceGroupManagers.Delete(app.Project, app.Zone, igm.Name).Do())
+			infof("destroying instance group template name=%s", lastComponent(igm.InstanceTemplate, "/"))
+			wait(gce.InstanceTemplates.Delete(app.Project, lastComponent(igm.InstanceTemplate, "/")).Do())
+		}
+
+		templates, err := gce.InstanceTemplates.List(app.Project).Filter(fmt.Sprintf(`name eq '%s-template.*'`, app.Name)).Do()
+		V(err)
+		for _, template := range templates.Items {
+			infof("destroying instance group template name=%s", template.Name)
+			wait(gce.InstanceTemplates.Delete(app.Project, template.Name).Do())
+		}
+
+		destroyGlobalResources(app)
+
+		// delete all items then delete the bucket
 		// (bucket cannot be deleted unless all items are deleted, at least with this delete call)
-		if bucketExists && ask("destroy the bucket "+inst.Bucket()+"?", false) {
-			infof("deleting bucket name=%s", inst.Bucket())
+		if bucketExists && ask("destroy the bucket "+app.Bucket()+"?", false) {
+			infof("destroying bucket name=%s", app.Bucket())
 			var query *storage.Query
 			for {
 				objects, err := bucket.List(ctx, query)
@@ -733,127 +589,188 @@ func appCommand(command string, args []string) {
 					break
 				}
 			}
-			V(gcs.Buckets.Delete(inst.Bucket()).Do())
+			V(gcs.Buckets.Delete(app.Bucket()).Do())
 		}
 	case "deploy":
+		if cmd.App.Package == "" {
+			exitf(`this app does not have a package set, try setting it with "engr config %s package <package>`, cmd.App.Name)
+		}
+
 		if !bucketExists {
-			infof("creating environment name=%s project=%s", inst.Deployment.Name, inst.Deployment.Project)
-			infof("creating bucket name=%s", inst.Bucket())
-			_, err = gcs.Buckets.Insert(inst.Deployment.Project, &rawstorage.Bucket{Name: inst.Bucket()}).Do()
+			if !ask("this app has never been deployed before, create it?", true) {
+				return
+			}
+			infof("creating environment name=%s project=%s", app.Name, app.Project)
+			infof("creating bucket name=%s", app.Bucket())
+			_, err := gcs.Buckets.Insert(app.Project, &rawstorage.Bucket{Name: app.Bucket()}).Do()
 			V(err)
-			gcsWrite("state.json", strings.NewReader("{}"))
-		} else if err != nil {
+			gcsWrite(app, "state.json", strings.NewReader("{}"))
+		}
+
+		infof("getting state")
+		state, err := getState(ctx, app.Bucket())
+		V(err)
+		state.Version++
+
+		if state.Version == 1 {
+			createGlobalResources(app)
+		}
+
+		path, err := buildExecutable(app, false)
+		V(err)
+
+		infof("uploading files")
+		buf := &bytes.Buffer{}
+		zw := zip.NewWriter(buf)
+		{
+			fw, err := zw.Create(filepath.Base(app.Package))
+			V(err)
+			r, err := os.Open(path)
+			V(err)
+			_, err = io.Copy(fw, r)
 			V(err)
 		}
 
-		deployVersion()
-	case "sync":
-		syncResources(inst)
+		V(zw.Close())
+		gcsVersionWrite(app, state.Version, "package.zip", buf)
+
+		if state.Version == 1 {
+			gcsVersionWrite(app, state.Version, "env.json", strings.NewReader("{}"))
+		} else {
+			gcsVersionCopy(app, state.Version-1, state.Version, "env.json")
+		}
+
+		{
+			j, err := json.Marshal(app)
+			V(err)
+			gcsVersionWrite(app, state.Version, "app.json", bytes.NewReader(j))
+		}
+
+		infof("updating state")
+		V(putState(ctx, app.Bucket(), state))
+
+		deployApp(app, state.Version)
+
+		infof("deployed version=%d", state.Version)
 	case "serve":
-		serve()
+		serve(app)
 	case "logs":
-		V(exec.Command("open", fmt.Sprintf("https://console.developers.google.com/logs?project=%s&service=custom.googleapis.com&key1=%s", inst.Deployment.Project, inst.App.Name)).Run())
+		V(exec.Command("open", fmt.Sprintf("https://console.developers.google.com/logs?project=%s&service=custom.googleapis.com&key1=%s", app.Project, app.Name)).Run())
 	case "status":
-		infof("app:%s", inst.App.Name)
-		state, err := engineer.GetState(ctx, inst.Bucket())
+		infof("app=%s", app.Name)
+		state, err := getState(ctx, app.Bucket())
 		V(err)
-		infof("version:%d", state.Version)
+		infof("version=%d", state.Version)
 
-		if !inst.App.Worker {
-			forwardingRule, err := gce.ForwardingRules.Get(inst.Deployment.Project, RegionFromZone(inst.Deployment.Zone), inst.ForwardingRule()).Do()
+		if app.Server {
+			forwardingRule, err := gce.ForwardingRules.Get(app.Project, app.Region(), app.ForwardingRule()).Do()
 			V(err)
-			infof("ip:%s", forwardingRule.IPAddress)
+			infof("ip=%s", forwardingRule.IPAddress)
 		}
 
-		igm, err := gce.InstanceGroupManagers.Get(inst.Deployment.Project, inst.Deployment.Zone, inst.InstanceGroup()).Do()
+		resp, err := gce.InstanceGroupManagers.List(app.Project, app.Zone).Filter(fmt.Sprintf(`name eq '%s-group.*'`, app.Name)).Do()
 		V(err)
-		parts := strings.Split(igm.InstanceTemplate, "-")
-		infof("template_version:%s", parts[len(parts)-1])
-		infof("target_size:%d", igm.TargetSize)
+		for _, igm := range resp.Items {
+			infof("\n\ninstance-group=%s", igm.Name)
 
-		instanceTemplate, err := gce.InstanceTemplates.Get(inst.Deployment.Project, lastPathComponent(igm.InstanceTemplate)).Do()
-		V(err)
-		infof("instance_type:%s", instanceTemplate.Properties.MachineType)
+			parts := strings.Split(igm.InstanceTemplate, "-")
+			versionRaw := parts[len(parts)-1]
+			version, err := strconv.Atoi(versionRaw)
+			V(err)
 
-		result, err := gce.InstanceGroupManagers.ListManagedInstances(inst.Deployment.Project, inst.Deployment.Zone, inst.InstanceGroup()).Do()
-		V(err)
-		infof("instance_count:%d", len(result.ManagedInstances))
+			infof("template-version=%d", version)
 
-		infof("scopes:%v", instanceTemplate.Properties.ServiceAccounts[0].Scopes)
-		tags := []string{}
-		if instanceTemplate.Properties.Tags != nil {
-			tags = instanceTemplate.Properties.Tags.Items
-		}
-		infof("tags:%v", tags)
+			instanceTemplate, err := gce.InstanceTemplates.Get(app.Project, lastComponent(igm.InstanceTemplate, "/")).Do()
+			V(err)
+			infof("instance-type=%s", instanceTemplate.Properties.MachineType)
 
-		for _, instance := range result.ManagedInstances {
-			instanceName := lastPathComponent(instance.Instance)
-			result, err := gce.Instances.Get(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do()
-			if is404Error(err) {
-				continue
+			infof("target-size=%d", igm.TargetSize)
+
+			result, err := gce.InstanceGroupManagers.ListManagedInstances(app.Project, app.Zone, igm.Name).Do()
+			V(err)
+			infof("instance-count=%d", len(result.ManagedInstances))
+
+			infof("scopes=%s", strings.Join(instanceTemplate.Properties.ServiceAccounts[0].Scopes, " "))
+			tags := []string{}
+			if instanceTemplate.Properties.Tags != nil {
+				tags = instanceTemplate.Properties.Tags.Items
 			}
-			V(err)
-			infof("\n%s", instanceName)
+			infof("tags=%s", strings.Join(tags, " "))
 
-			instanceTemplate := ""
-			for _, item := range result.Metadata.Items {
-				if item.Key == "instance-template" {
-					instanceTemplate = lastPathComponent(*item.Value)
-					break
+			infof("\ninstance status")
+			tc, _ := context.WithTimeout(ctx, 15*time.Second)
+			msgs, err := RPC(tc, app.Name, internal.CommandStatus, 0, len(getInstances(app, igm.Name)))
+			if err != context.DeadlineExceeded {
+				V(err)
+			}
+			instanceStatus := map[string]internal.StatusResult{}
+			for _, msg := range msgs {
+				instanceStatus[msg.Instance] = msg.StatusResult
+			}
+
+			for _, instance := range result.ManagedInstances {
+				instanceName := lastComponent(instance.Instance, "/")
+				result, err := gce.Instances.Get(app.Project, app.Zone, instanceName).Do()
+				if is404Error(err) {
+					continue
 				}
-			}
-			parts := strings.Split(instanceTemplate, "-")
-			infof("  template_version:%s", parts[len(parts)-1])
-			infof("  status:%s", result.Status)
+				V(err)
+				infof(instanceName+"[status]=%s", result.Status)
 
-			if !inst.App.Worker {
-				health, err := gce.TargetPools.GetHealth(inst.Deployment.Project, RegionFromZone(inst.Deployment.Zone), inst.TargetPool(), &compute.InstanceReference{Instance: instance.Instance}).Do()
-				if err == nil {
-					infof("  health:%+v", health.HealthStatus[0].HealthState)
+				if app.Server {
+					health, err := gce.TargetPools.GetHealth(app.Project, app.Region(), app.TargetPool(), &compute.InstanceReference{Instance: instance.Instance}).Do()
+					if err == nil {
+						infof(instanceName+"[health]=%+v", health.HealthStatus[0].HealthState)
+					} else {
+						infof(instanceName + "[health]=UNKNOWN")
+					}
+				}
+
+				created, err := time.Parse(time.RFC3339, result.CreationTimestamp)
+				V(err)
+				infof(instanceName+"[instance-age]=%s", formatDuration(time.Now().Sub(created)))
+
+				status, ok := instanceStatus[instanceName]
+				if ok {
+					infof(instanceName+"[instance-uptime]=%s", formatDuration(status.InstanceUptime))
+					infof(instanceName+"[app-uptime]=%s", formatDuration(status.AppUptime))
+					infof(instanceName+"[app-version]=%d", status.AppVersion)
 				} else {
-					infof("  health:UNKNOWN")
+					infof(instanceName + "[instance-uptime]=UNKNOWN")
+					infof(instanceName + "[app-uptime]=UNKNOWN")
+					infof(instanceName + "[app-version]=UNKNOWN")
 				}
 			}
-
-			created, err := time.Parse(time.RFC3339, result.CreationTimestamp)
-			V(err)
-			infof("  instance_age:%s", formatDuration(time.Now().Sub(created)))
-
-			status, err := getInstanceStatus(instanceName)
-			if err == nil {
-				infof("  instance_uptime:%s", formatDuration(status.InstanceUptime))
-				infof("  app_uptime:%s", formatDuration(status.AppUptime))
-				infof("  app_version:%d", status.AppVersion)
-			} else {
-				infof("  instance_uptime:UNKNOWN")
-				infof("  app_uptime:UNKNOWN")
-				infof("  app_version:UNKNOWN")
-			}
 		}
-	case "env", "setenv":
-		state, err := engineer.GetState(ctx, inst.Bucket())
+	case "env", "env:get", "env:set", "env:unset":
+		state, err := getState(ctx, app.Bucket())
 		V(err)
 		if state.Version == 0 {
 			exitf("no version deployed yet")
 		}
 
-		env, err := getEnv(state.Version)
+		env, err := getEnv(app, state.Version)
 		V(err)
 
-		infof("old environment:")
-		printEnv(env)
-
-		switch command {
+		switch cmd.Name {
 		case "env":
-			printEnv(env)
-			return
-		case "setenv":
-			if len(args) != 2 {
-				exitf("you need to specify a key and a value to this command")
+			for k, v := range env {
+				infof("%s=%s", k, v)
+			}
+		case "env:get":
+			if len(cmd.Args) != 1 {
+				exitf("you must specify a key")
+			}
+			k := cmd.Args[0]
+			infof("%s=%s", k, env[k])
+		case "env:set", "env:unset":
+			key := cmd.Args[0]
+			value := cmd.Args[1]
+
+			if cmd.Name == "env:unset" {
+				value = ""
 			}
 
-			key := args[0]
-			value := args[1]
 			if strings.HasPrefix(value, "@") {
 				// load from file
 				contents, err := ioutil.ReadFile(value[1:])
@@ -865,27 +782,27 @@ func appCommand(command string, args []string) {
 			} else {
 				env[key] = value
 			}
+
+			infof("%s=%s", key, value)
+
+			infof("updating state")
+			state.Version++
+			gcsVersionCopy(app, state.Version-1, state.Version, "package.zip")
+			gcsVersionCopy(app, state.Version-1, state.Version, "app.json")
+			putEnv(app, state.Version, env)
+			V(putState(ctx, app.Bucket(), state))
+
+			deployApp(app, state.Version)
+			infof("deployed version=%d", state.Version)
+		default:
+			exitf("unrecognized command")
 		}
-
-		infof("new environment:")
-		printEnv(env)
-
-		infof("updating state")
-		state.Version++
-		gcsVersionCopy(state.Version-1, state.Version, "package.zip")
-		gcsVersionCopy(state.Version-1, state.Version, "app.json")
-		putEnv(state.Version, env)
-		V(engineer.PutState(ctx, inst.Bucket(), state))
-
-		infof("updating instances")
-		sshInstances(getInstances(), "update")
-		infof("deployed version=%d", state.Version)
 	case "rollback":
-		version, err := strconv.Atoi(args[0])
+		version, err := strconv.Atoi(cmd.Args[0])
 		if err != nil {
 			exitf("version must be a number")
 		}
-		state, err := engineer.GetState(ctx, inst.Bucket())
+		state, err := getState(ctx, app.Bucket())
 		V(err)
 		if state.Version == version {
 			exitf("can't rollback to the current version")
@@ -897,29 +814,35 @@ func appCommand(command string, args []string) {
 		infof("rolling back to version=%d", version)
 		infof("updating state")
 		state.Version++
-		gcsVersionCopy(version, state.Version, "package.zip")
-		gcsVersionCopy(version, state.Version, "app.json")
-		gcsVersionCopy(version, state.Version, "env.json")
-		V(engineer.PutState(ctx, inst.Bucket(), state))
+		gcsVersionCopy(app, version, state.Version, "package.zip")
+		gcsVersionCopy(app, version, state.Version, "app.json")
+		gcsVersionCopy(app, version, state.Version, "env.json")
+		V(putState(ctx, app.Bucket(), state))
 
-		infof("updating instances")
-		sshInstances(getInstances(), "update")
+		// get the old version of the app from GCS
+		originalApp := app
+		appJson := gcsVersionRead(originalApp, version, "app.json")
+		app = internal.App{}
+		V(json.Unmarshal(appJson, &app))
+		app.Name = originalApp.Name
+
+		deployApp(app, state.Version)
 		infof("deployed version=%d", state.Version)
 	case "run":
-		state, err := engineer.GetState(ctx, inst.Bucket())
+		state, err := getState(ctx, app.Bucket())
 		V(err)
 		if state.Version == 0 {
 			exitf("no version deployed yet")
 		}
 
-		env, err := getEnv(state.Version)
+		env, err := getEnv(app, state.Version)
 		V(err)
 
 		environment := []string{
 			"GOPATH=" + os.Getenv("GOPATH"),
 			"GOOGLE_APPLICATION_CREDENTIALS=" + os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-			"ENGR_PROJECT=" + inst.Deployment.Project,
-			"ENGR_APP=" + inst.App.Name,
+			"ENGR_PROJECT=" + app.Project,
+			"ENGR_APP=" + app.Name,
 			"ENGR_VERSION=" + strconv.Itoa(state.Version),
 		}
 
@@ -927,245 +850,275 @@ func appCommand(command string, args []string) {
 			environment = append(environment, fmt.Sprintf("%s=%s", k, v))
 		}
 
-		path, err := exec.LookPath(args[0])
+		path, err := exec.LookPath(cmd.Args[0])
 		V(err)
-		V(syscall.Exec(path, args, environment))
-	default:
-		exitf("invalid command=%s", command)
-	}
-}
-
-func globalCommand(command string, args []string) {
-	switch command {
-	case "build-image":
-		baseImageURL := ""
-		scriptPath := ""
-		// flag library requires that flags appear before the positional args, which messes up the existing commands
-		for _, arg := range args {
-			if arg[0] != '-' {
-				exitf("invalid argument=%s", arg)
-			}
-			index := strings.Index(arg, "=")
-			if index == -1 {
-				exitf("invalid argument=%s", arg)
-			}
-			key := arg[1:index]
-			value := arg[index+1:]
-			switch key {
-			case "script":
-				scriptPath = value
-			case "base-image-url":
-				baseImageURL = value
-			default:
-				exitf("invalid argument=%s", arg)
-			}
-		}
-
-		if baseImageURL == "" {
-			imageList, err := gce.Images.List("debian-cloud").Filter("name eq 'debian-8-.*'").Do()
-			V(err)
-			for _, image := range imageList.Items {
-				if image.Deprecated != nil {
-					continue
-				}
-				baseImageURL = image.SelfLink
-				break
-			}
-		}
-
-		commands := []string{
-			"apt-get update",
-			"env DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes --force-yes",
-		}
-		if scriptPath != "" {
-			commands = []string{}
-			file, err := os.Open(scriptPath)
-			V(err)
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				commands = append(commands, scanner.Text())
-			}
-			V(scanner.Err())
-			file.Close()
-		}
-
-		const (
-			instanceName = "engr-build-image"
-		)
-
-		_, err := gce.Instances.Get(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do()
-		if err == nil {
-			infof("deleting existing instance")
-			wait(gce.Instances.Delete(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do())
-		} else if !is404Error(err) {
-			V(err)
-		}
-
-		_, err = gce.Disks.Get(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do()
-		if err == nil {
-			infof("deleting existing disk")
-			wait(gce.Disks.Delete(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do())
-		} else if !is404Error(err) {
-			V(err)
-		}
-
-		instance := &compute.Instance{
-			MachineType: "zones/" + inst.Deployment.Zone + "/machineTypes/n1-standard-1",
-			Name:        instanceName,
-			Disks: []*compute.AttachedDisk{
-				&compute.AttachedDisk{
-					Boot:             true,
-					InitializeParams: &compute.AttachedDiskInitializeParams{SourceImage: baseImageURL},
-				},
-			},
-			NetworkInterfaces: []*compute.NetworkInterface{
-				{
-					Network: "global/networks/default",
-					AccessConfigs: []*compute.AccessConfig{
-						{
-							Name: "External NAT",
-						},
-					},
-				},
-			},
-		}
-
-		infof("creating instance name=%s", instanceName)
-		wait(gce.Instances.Insert(inst.Deployment.Project, inst.Deployment.Zone, instance).Do())
-
-		client, err := createSSHClient(ipForInstance(instanceName), 60*time.Second)
+		V(syscall.Exec(path, cmd.Args, environment))
+	case "destroy":
+		version, err := strconv.Atoi(cmd.Args[0])
 		V(err)
-
-		for _, command := range commands {
-			s, err := client.NewSession()
-			V(err)
-			fmt.Printf("running command: %s\n", command)
-			s.Stdout = os.Stdout
-			s.Stderr = os.Stdout
-			if err := s.Run(command); err != nil {
-				errorf("ssh command failed err=%v", err)
-			}
-			s.Close()
-		}
-
-		infof("deleting instance")
-		wait(gce.Instances.Delete(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do())
-
-		imageName := "engr-image-" + time.Now().Format("20060102t150405")
-		infof("creating image")
-		image := &compute.Image{
-			Name:       imageName,
-			SourceDisk: fmt.Sprintf("zones/%s/disks/%s", inst.Deployment.Zone, instanceName),
-		}
-		wait(gce.Images.Insert(inst.Deployment.Project, image).Do())
-
-		infof("deleting disk")
-		wait(gce.Disks.Delete(inst.Deployment.Project, inst.Deployment.Zone, instanceName).Do())
-
-		infof("created image=%s", imageName)
+		destroyInstanceGroup(app, app.InstanceGroup(version))
 	default:
-		exitf("invalid command=%s", command)
+		exitf("invalid command=%s", cmd.Name)
 	}
 }
 
 func main() {
-	var err error
-	config := Config{}
-	{
-		contents, err := ioutil.ReadFile("engr.json")
-		if err != nil {
-			exitf("could not read engr.json")
-		}
-
-		if err := json.Unmarshal(contents, &config); err != nil {
-			exitf("could not parse engr.json")
-		}
-	}
-
 	args := os.Args[1:]
 
 	if len(args) < 2 {
-		fmt.Printf(`Usage: engr <deployment> <app> <command>
+		fmt.Printf(`Usage: engr <app> <command>
 
-Where deployment and app are defined in "engr.json"
 Command must be one of:
 
-  serve - runs the app on the local machine with the environment of the app
-  deploy - deploy a new version of the app or create the first version
-    this command will cause a new version to be deployed
-	sync - update server resources
-
-  rollback <version> - rollback to the specified version
-    this command will cause a new version to be deployed
-  status - prints out the status of the app
-  env - prints the current environment
-  setenv <key> <value> - sets the value of a key to the provided string
-			   <key> @<filename> - sets the value of a key to the contents of the file
-				 <key> "" - removes the key
-    this command will cause a new version to be deployed
-	destroy - destroys all resources for the app
-	run - run a script on the local machine with the environment of the app
-	logs - open a browser window to show the logs for this app
-
-Global commands:
-Usage: engr <deployment> <command> [options]
-
-	build-image - build an image starting from the specified base
-	   image and using the provided script
-		 options:
-			 -base-image-url=<base image>
-			   the default base image is debian-8
-			 -script=<script>
-			   the default script will install updates to all installed packages
+	serve
+	deploy
+	destroy
+	create
+	local-serve
+	config
+	config:get
+	config:set
+	config:unset
+	rollback
+	status
+	env
+	env:get
+	env:set (@filename)
+	env:unset
+	destroy-app
+	run
+	logs
+	debug
 `)
+		os.Exit(1)
+		return
+	}
+
+	appName := args[0]
+	command := args[1]
+
+	if command == "create" {
+		if !exists("engr.json") {
+			if err := ioutil.WriteFile("engr.json", []byte("{}"), 0644); err != nil {
+				exitf("could not create engr.json")
+			}
+		}
+
+		config := readConfig()
+
+		if config.Apps == nil {
+			config.Apps = map[string]internal.App{}
+		}
+
+		if _, ok := config.Apps[appName]; !ok {
+			infof("creating app=%s", appName)
+			infof(`set a project for your app with "engr %s config:set project <project>"`, appName)
+			infof(`deploy the app with "engr %s deploy"`, appName)
+			config.Apps[appName] = internal.App{
+				Package:       "github.com/pushbullet/engineer/examples/environ",
+				Server:        true,
+				Scopes:        []string{},
+				Tags:          []string{"http-server"},
+				Zone:          "us-central1-c",
+				InstanceCount: 1,
+				MachineType:   "f1-micro",
+			}
+		}
+
+		writeConfig(config)
+		return
+	}
+
+	config := Config{}
+	{
+		if !exists("engr.json") {
+			exitf(`could not find engr.json, please run "engr <app> create" to create it`)
+		}
+
+		config = readConfig()
+	}
+
+	app, ok := config.Apps[appName]
+	if !ok && command != "destroy-app" && command != "create" {
+		exitf("invalid app name=%s", appName)
+	}
+	app.Name = appName
+
+	if command == "debug" {
+		V(exec.Command("open", "https://console.cloud.google.com/debug?project="+app.Project).Run())
+		return
+	}
+
+	if command == "logs" {
+		url := fmt.Sprintf("https://console.developers.google.com/logs?project=%s&service=custom.googleapis.com&key1=%s", app.Project, app.Name)
+		V(exec.Command("open", url).Run())
+		return
+	}
+
+	if strings.HasPrefix(command, "config") {
+		config := readConfig()
+
+		printKey := func(key string) {
+			switch key {
+			case "package":
+				infof("package=%s", app.Package)
+			case "server":
+				infof("server=%v", app.Server)
+			case "debug":
+				infof("debug=%v", app.Debug)
+			case "graceful-shutdown":
+				infof("graceful-shutdown=%v", app.GracefulShutdown)
+			case "scopes":
+				infof("scopes=%s", strings.Join(app.Scopes, " "))
+			case "tags":
+				infof("tags=%s", strings.Join(app.Tags, " "))
+			case "instance-count":
+				infof("instance-count=%d", app.InstanceCount)
+			case "machine-type":
+				infof("machine-type=%s", app.MachineType)
+			case "project":
+				infof("project=%s", app.Project)
+			case "zone":
+				infof("zone=%s", app.Zone)
+			case "image":
+				infof("image=%s", app.Image)
+			case "staged-deploy":
+				infof("staged-deploy=%v", app.StagedDeploy)
+			case "generate":
+				infof("generate=%v", app.Generate)
+			default:
+				exitf("unrecognized configuration option name=%s", args[2])
+			}
+		}
+
+		switch command {
+		case "config":
+			infof("package=%s", app.Package)
+			infof("server=%v", app.Server)
+			infof("debug=%v", app.Debug)
+			infof("graceful-shutdown=%v", app.GracefulShutdown)
+			infof("scopes=%s", strings.Join(app.Scopes, " "))
+			infof("tags=%s", strings.Join(app.Tags, " "))
+			infof("instance-count=%d", app.InstanceCount)
+			infof("machine-type=%s", app.MachineType)
+			infof("project=%s", app.Project)
+			infof("zone=%s", app.Zone)
+			infof("image=%s", app.Image)
+			infof("staged-deploy=%v", app.StagedDeploy)
+			infof("generate=%v", app.Generate)
+		case "config:get":
+			if len(args) != 3 {
+				exitf("you must specify a key")
+			}
+			printKey(args[2])
+		case "config:set", "config:unset":
+			key := args[2]
+			values := args[3:]
+
+			if command == "config:unset" {
+				values = []string{""}
+			}
+
+			switch key {
+			case "package":
+				app.Package = values[0]
+			case "server":
+				app.Server = values[0] == "true"
+			case "debug":
+				app.Debug = values[0] == "true"
+			case "graceful-shutdown":
+				app.GracefulShutdown = values[0] == "true"
+			case "scopes":
+				scopes := []string{}
+				for _, v := range values {
+					if v != "" {
+						scopes = append(scopes, v)
+					}
+				}
+				app.Scopes = scopes
+			case "tags":
+				tags := []string{}
+				for _, v := range values {
+					if v != "" {
+						tags = append(tags, v)
+					}
+				}
+				app.Tags = tags
+			case "instance-count":
+				i, err := strconv.Atoi(values[0])
+				if err != nil {
+					exitf("invalid number=%s", values[0])
+				}
+				app.InstanceCount = i
+			case "machine-type":
+				app.MachineType = values[0]
+			case "project":
+				app.Project = values[0]
+			case "zone":
+				app.Zone = values[0]
+			case "image":
+				app.Image = values[0]
+			case "staged-deploy":
+				app.StagedDeploy = values[0] == "true"
+			case "generate":
+				app.Generate = values[0] == "true"
+			default:
+				exitf("unrecognized configuration option name=%s", key)
+			}
+			config.Apps[appName] = app
+			writeConfig(config)
+			printKey(key)
+		}
+
+		return
+	}
+
+	cmd := Command{
+		Name:              command,
+		Args:              args[2:],
+		AppBucketRequired: true,
+	}
+
+	switch cmd.Name {
+	case "destroy-app", "deploy", "logs":
+		cmd.AppBucketRequired = false
+	}
+
+	cmd.App = app
+
+	if command == "local-serve" {
+		cmd.App.Local = true
+		serve(cmd.App)
 		return
 	}
 
 	{
-		deploymentName := args[0]
-
-		deployment, ok := config.Deployments[deploymentName]
-		if !ok {
-			exitf("invalid deployment name=%s", deploymentName)
+		if cmd.App.Project == "" {
+			exitf(`this app does not have a project set, try setting it with "engr %s config:set project <project>`, cmd.App.Name)
 		}
-		deployment.Name = deploymentName
 
-		inst = Install{
-			Deployment: deployment,
+		client, err := google.DefaultClient(oauth2.NoContext, "https://www.googleapis.com/auth/devstorage.read_write", "https://www.googleapis.com/auth/compute", "https://www.googleapis.com/auth/pubsub")
+		if err != nil {
+			exitf("could not find google account, make sure you have run `gcloud auth login`\nerr=%v", err)
 		}
-	}
+		gce, err = compute.New(client)
+		V(err)
+		gcs, err = rawstorage.New(client)
+		V(err)
+		gcps, err = rawpubsub.New(client)
+		V(err)
 
-	os.Setenv("ENGR_DEVELOPMENT", "1")
-	os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", inst.Deployment.KeyPath)
-	client, err := google.DefaultClient(oauth2.NoContext, "https://www.googleapis.com/auth/devstorage.read_write", "https://www.googleapis.com/auth/compute")
-	if err != nil {
-		exitf("could not find google account, make sure you have run `gcloud auth login`\nerr=%v", err)
-	}
-	gce, err = compute.New(client)
-	V(err)
-	gcs, err = rawstorage.New(client)
-	V(err)
+		// do a test request to see if our token is good
+		if _, err := gcs.Buckets.List(cmd.App.Project).Do(); err != nil {
+			exitf("google account does not seem to work, try running `gcloud auth login`\nerr=%v", err)
+		}
 
-	// do a test request to see if our token is good
-	if _, err := gcs.Buckets.List(inst.Deployment.Project).Do(); err != nil {
-		exitf("google account does not seem to work, try running `gcloud auth login`\nerr=%v", err)
+		ctx = cloud.NewContext(cmd.App.Project, client)
+		storageClient, err = storage.NewClient(ctx)
+		V(err)
 	}
-
-	ctx = cloud.NewContext(inst.Deployment.Project, client)
-	storageClient, err = storage.NewClient(ctx)
-	V(err)
 
 	start := time.Now()
-
-	app, ok := config.Apps[args[1]]
-	if ok || (len(args) > 2 && args[2] == "destroy") {
-		app.Name = args[1]
-		inst.App = app
-		appCommand(args[2], args[3:])
-		infof("elapsed: %.1fs", time.Now().Sub(start).Seconds())
-	} else if args[1] == "build-image" {
-		globalCommand(args[1], args[2:])
-	} else {
-		exitf("invalid app name=%s", args[1])
-	}
+	runCommand(cmd)
+	infof("elapsed: %.1fs", time.Now().Sub(start).Seconds())
 }

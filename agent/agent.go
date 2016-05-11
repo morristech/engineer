@@ -5,10 +5,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,14 +20,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pushbullet/engineer"
+	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/cloud"
 	"google.golang.org/cloud/compute/metadata"
 	"google.golang.org/cloud/logging"
+	"google.golang.org/cloud/pubsub"
 	"google.golang.org/cloud/storage"
+)
+
+const (
+	localVersionPath = "/agent/version"
+	appUID           = 2000
 )
 
 var (
@@ -36,25 +43,19 @@ var (
 	project string
 )
 
-const (
-	localStatePath = "/agent/state.json"
-	socketPath     = "/tmp/agent/agent.sock"
-	appUID         = 2000
-)
-
 func log(level logging.Level, prefix string, message string, labels map[string]string) {
 	if strings.HasPrefix(message, "http: TLS handshake error from ") {
 		// there's a bunch of these caused by HTTPS port scanners, so just discard these in production
 		// https://groups.google.com/forum/#!topic/golang-nuts/d4sjZR7H4gU
 		return
 	}
-	printMessage := message
-	if level == logging.Error {
-		printMessage = "ERROR: " + message
-	}
-	fmt.Println("[" + prefix + "] " + printMessage)
 
 	if logger == nil {
+		printMessage := message
+		if level == logging.Error {
+			printMessage = "ERROR: " + message
+		}
+		fmt.Println("[" + prefix + "] " + printMessage)
 		return
 	}
 
@@ -116,20 +117,6 @@ func Exists(path string) bool {
 	return true
 }
 
-func sendMessage(msg string) string {
-	if Exists(socketPath) {
-		sock, err := net.Dial("unix", socketPath)
-		V(err)
-		_, err = sock.Write([]byte(msg + "\n"))
-		V(err)
-		r := bufio.NewReader(sock)
-		line, err := r.ReadString('\n')
-		V(err)
-		return strings.TrimSpace(line)
-	}
-	return ""
-}
-
 func Run(command string) {
 	fmt.Println("RUN:", command)
 	args := strings.Split(command, " ")
@@ -160,67 +147,124 @@ func versionDir(version int) string {
 	return "/agent/" + versionName
 }
 
-func fetchVersion(c context.Context, bucketName string, version int) string {
+func fetchVersion(c context.Context, bucketName string, version int) error {
 	infof("fetching version %d", version)
 	versionName := strconv.Itoa(version)
 	dir := versionDir(version)
 	tmpDir, err := ioutil.TempDir("", "")
-	V(err)
+	if err != nil {
+		return err
+	}
 
 	client, err := storage.NewClient(c)
-	V(err)
+	if err != nil {
+		return err
+	}
 	bucket := client.Bucket(bucketName)
 
 	if !Exists(dir) {
 		infof("reading package")
 		r, err := bucket.Object(versionName + "/package.zip").NewReader(c)
-		V(err)
+		if err != nil {
+			return err
+		}
 		contents, err := ioutil.ReadAll(r)
-		V(err)
+		if err != nil {
+			return err
+		}
 		z, err := zip.NewReader(bytes.NewReader(contents), int64(len(contents)))
-		V(err)
+		if err != nil {
+			return err
+		}
 
 		for _, f := range z.File {
 			infof("extracting file %s", f.Name)
 			input, err := f.Open()
-			V(err)
+			if err != nil {
+				return err
+			}
 			output, err := os.OpenFile(tmpDir+"/"+f.Name, os.O_CREATE|os.O_WRONLY, 0644)
-			V(err)
+			if err != nil {
+				return err
+			}
 			_, err = io.Copy(output, input)
-			V(err)
+			if err != nil {
+				return err
+			}
 			input.Close()
 			output.Close()
 		}
 
-		V(os.Rename(tmpDir, dir))
-		V(os.Chmod(dir, 0755))
+		if err := os.Rename(tmpDir, dir); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0755); err != nil {
+			return err
+		}
 	}
 
 	for _, filename := range []string{"app.json", "env.json"} {
 		r, err := bucket.Object(versionName + "/" + filename).NewReader(c)
-		V(err)
+		if err != nil {
+			return err
+		}
 		contents, err := ioutil.ReadAll(r)
-		V(err)
+		if err != nil {
+			return err
+		}
 		path := filepath.Join(dir, filename)
-		V(ioutil.WriteFile(path, contents, 0644))
+		if err := ioutil.WriteFile(path, contents, 0644); err != nil {
+			return err
+		}
 	}
 
-	// allow the app to bind low ports as not root
 	appJson, err := ioutil.ReadFile(dir + "/app.json")
-	V(err)
-	app := engineer.App{}
-	V(json.Unmarshal(appJson, &app))
-	exePath := filepath.Join(dir, filepath.Base(app.Executable))
-	V(os.Chmod(exePath, 0755))
-	// let executable bind lower ports as non-root user
-	V(exec.Command("setcap", "cap_net_bind_service=+ep", exePath).Run())
+	if err != nil {
+		return err
+	}
+	app := internal.App{}
+	if err := json.Unmarshal(appJson, &app); err != nil {
+		return err
+	}
 
-	return dir
+	exePath := filepath.Join(dir, filepath.Base(app.Package))
+	if err := os.Chmod(exePath, 0755); err != nil {
+		return err
+	}
+
+	// let executable bind lower ports as non-root user
+	if err := exec.Command("setcap", "cap_net_bind_service=+ep", exePath).Run(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func runCloudDebugger(app internal.App, version int) ([]string, error) {
+	resp, err := http.Get("https://storage.googleapis.com/cloud-debugger/compute-go/cd_go_agent.sh")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	debuggerScript, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	dir := versionDir(version)
+	cmd := exec.Command("/bin/bash", "-e", "-s", "--", "--program="+filepath.Join(dir, filepath.Base(app.Package)), "--module="+appName, "--version="+strconv.Itoa(version))
+	cmd.Stdin = bytes.NewReader(debuggerScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("cloud debugger failed err=%v output=%s", err, output)
+	}
+
+	return strings.Split(strings.TrimSpace(string(output)), " "), nil
 }
 
 type AppProcess struct {
 	Command          *exec.Cmd
-	Worker           bool
 	GracefulShutdown bool
 	Exited           chan bool
 }
@@ -233,7 +277,7 @@ func startVersion(version int) (*AppProcess, error) {
 		return nil, err
 	}
 
-	app := engineer.App{}
+	app := internal.App{}
 	if err := json.Unmarshal(appJson, &app); err != nil {
 		return nil, err
 	}
@@ -260,15 +304,29 @@ func startVersion(version int) (*AppProcess, error) {
 		environment = append(environment, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	cmd := &exec.Cmd{
-		Path: filepath.Join(dir, filepath.Base(app.Executable)),
-		Dir:  "/tmp",
-		Env:  environment,
+	cmd := exec.Command(filepath.Join(dir, filepath.Base(app.Package)))
+	if app.Debug {
+		args, err := runCloudDebugger(app, version)
+		if err != nil {
+			return nil, errors.New("failed to run cloud debugger")
+		}
+		infof("running cloud debugger")
+		cmd = exec.Command(args[0], args[1:]...)
+	}
+
+	cmd.Dir = "/tmp"
+	cmd.Env = environment
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: appUID, Gid: appUID},
+		// Pdeathsig should be set so that if the agent dies, it can restart the child process
+		// without it, the child process will still be running and no longer monitored by the agent
+		// Pdeathsig: syscall.SIGKILL,
+		// this doesn't work since we use setcap on the executable
 	}
 
 	ap := &AppProcess{
 		Command:          cmd,
-		Worker:           app.Worker,
 		GracefulShutdown: app.GracefulShutdown,
 		Exited:           make(chan bool, 1),
 	}
@@ -315,7 +373,12 @@ func startVersion(version int) (*AppProcess, error) {
 			defer wg.Done()
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				log(logging.Error, appName, scanner.Text(), labels)
+				level := logging.Error
+				if app.Debug {
+					// the debugger takes stdout from the child process and reroutes it to stderr
+					level = logging.Info
+				}
+				log(level, appName, scanner.Text(), labels)
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -328,6 +391,93 @@ func startVersion(version int) (*AppProcess, error) {
 	}()
 
 	return ap, nil
+}
+
+func ReceiveMessage(c context.Context, appName string, sub string) (*internal.Message, error) {
+	topic := internal.TopicFromAppName(appName)
+
+	m, err := receiveMessage(c, topic, sub)
+	if err != nil {
+		if e, ok := err.(*googleapi.Error); ok && e.Code == 404 {
+			if err := pubsub.CreateSub(c, sub, topic, 10*time.Second, ""); err != nil {
+				return nil, err
+			}
+			return receiveMessage(c, topic, sub)
+		}
+		return nil, err
+	}
+
+	return m, nil
+}
+
+func receiveMessage(c context.Context, topic, sub string) (*internal.Message, error) {
+	msgs, err := pubsub.PullWait(c, sub, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	msg := msgs[0]
+
+	if err := pubsub.Ack(c, sub, msg.AckID); err != nil {
+		return nil, err
+	}
+
+	m := internal.Message{}
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
+func updateCall(c context.Context, bucket string, version int) error {
+	if err := fetchVersion(c, bucket, version); err != nil {
+		return err
+	}
+	if err := ioutil.WriteFile(localVersionPath, []byte(strconv.Itoa(version)), 0644); err != nil {
+		return err
+	}
+	return nil
+}
+
+func statusCall() (internal.StatusResult, error) {
+	sr := internal.StatusResult{}
+	{
+		contents, err := ioutil.ReadFile("/proc/uptime")
+		if err != nil {
+			return sr, err
+		}
+
+		parts := strings.Split(string(contents), " ")
+		f, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return sr, err
+		}
+		sr.InstanceUptime = time.Duration(f) * time.Second
+	}
+
+	sr.AppVersion = getAppVersion()
+	return sr, nil
+}
+
+func getAppVersion() int {
+	if Exists(localVersionPath) {
+		contents, err := ioutil.ReadFile(localVersionPath)
+		V(err)
+		version, err := strconv.Atoi(string(contents))
+		V(err)
+		return version
+	} else {
+		versionRaw, err := metadata.Get("instance/attributes/app-version")
+		V(err)
+		version, err := strconv.Atoi(versionRaw)
+		V(err)
+		return version
+	}
 }
 
 func main() {
@@ -349,10 +499,6 @@ func main() {
 	c := cloud.NewContext(project, client)
 
 	// https://godoc.org/google.golang.org/cloud/logging
-	// https://cloud.google.com/logging/docs/api/ref/rest/v1beta3/projects.logs.entries/write
-	// https://github.com/google/google-api-go-client/blob/master/logging/v1beta3/logging-gen.go
-	// https://cloud.google.com/logging/docs/view/logs_index
-	// http://stackoverflow.com/questions/30698072/google-logging-api-what-service-name-to-use-when-writing-entries-from-non-goog
 	logger, err = logging.NewClient(c, project, "engineer", cloud.WithTokenSource(google.ComputeTokenSource("")))
 	V(err)
 	logger.CommonLabels = map[string]string{
@@ -369,6 +515,9 @@ func main() {
 	action := os.Args[1]
 	switch action {
 	case "run":
+		// kill any running copies of app since Pdeathsig doesn't work
+		exec.Command("pkill", "-9", "-u", strconv.Itoa(appUID)).Run()
+
 		shutdown := make(chan os.Signal, 1)
 		signal.Notify(shutdown, syscall.SIGTERM)
 
@@ -379,45 +528,60 @@ func main() {
 		var running bool
 		var offline bool
 
-		dir := filepath.Dir(socketPath)
-		V(os.MkdirAll(dir, 0700))
-		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-			V(err)
-		}
-		listen, err := net.Listen("unix", socketPath)
-		V(err)
 		go func() {
 			for {
-				sock, err := listen.Accept()
+				// will timeout after about 90 seconds on the remote side
+				m, err := ReceiveMessage(c, appName, instance)
 				if err != nil {
-					errorf("accept error=%v", err)
+					errorf("receive error=%v", err)
+					time.Sleep(30 * time.Second)
 					continue
 				}
 
-				scanner := bufio.NewScanner(sock)
-				for scanner.Scan() {
-					command := scanner.Text()
-					switch command {
-					case "update":
-						sock.Write([]byte("done\n"))
-						select {
-						case update <- true:
-						default:
-						}
-					case "uptime":
-						statusMutex.Lock()
-						if running {
-							sock.Write([]byte(fmt.Sprintf("%d\n", int(time.Now().Sub(start).Seconds()))))
-						} else {
-							sock.Write([]byte("0\n"))
-						}
-						statusMutex.Unlock()
-					default:
-						errorf("unrecognized command=%s", command)
+				if m == nil {
+					// didn't get a message
+					continue
+				}
+
+				if m.Published.Add(60 * time.Second).Before(time.Now()) {
+					infof("dropping old message")
+					continue
+				}
+
+				reply := func(c context.Context, resp internal.Message) {
+					resp.RequestID = m.RequestID
+					resp.Instance = instance
+					if err := internal.SendMessage(c, appName, resp); err != nil {
+						errorf("send error=%v", err)
 					}
 				}
-				if err := scanner.Err(); err != nil {
-					errorf("scanner error=%v", err)
+
+				switch m.Command {
+				case internal.CommandUpdate:
+					if err := updateCall(c, bucket, m.UpdateVersion); err != nil {
+						reply(c, internal.Message{Error: err.Error()})
+						continue
+					}
+					reply(c, internal.Message{})
+
+					select {
+					case update <- true:
+					default:
+					}
+				case internal.CommandStatus:
+					sr, err := statusCall()
+					if err != nil {
+						reply(c, internal.Message{Error: err.Error()})
+						continue
+					}
+					statusMutex.Lock()
+					if running {
+						sr.AppUptime = time.Now().Sub(start)
+					}
+					statusMutex.Unlock()
+					reply(c, internal.Message{StatusResult: sr})
+				default:
+					// replies will show up here, since we use just a single topic
 				}
 			}
 		}()
@@ -445,12 +609,9 @@ func main() {
 
 		// agent should not die accidentally within this loop unless something is really wrong
 		for {
-			contents, err := ioutil.ReadFile(localStatePath)
-			V(err)
-			state := engineer.State{}
-			V(json.Unmarshal(contents, &state))
+			appVersion := getAppVersion()
 
-			if state.Version == 0 {
+			if appVersion == 0 {
 				select {
 				case <-shutdown:
 					exit(0)
@@ -459,7 +620,7 @@ func main() {
 				continue
 			}
 
-			ap, err := startVersion(state.Version)
+			ap, err := startVersion(appVersion)
 			if err != nil {
 				errorf("failed to start app err=%v", err)
 				time.Sleep(5 * time.Second)
@@ -488,6 +649,7 @@ func main() {
 				infof("shutting down in 60 seconds")
 				time.Sleep(60 * time.Second)
 				infof("shutting down")
+				pubsub.DeleteTopic(c, instance)
 				exit(0)
 			case <-update:
 				infof("updating")
@@ -515,7 +677,7 @@ func main() {
 				statusMutex.Lock()
 				running = false
 				statusMutex.Unlock()
-				time.Sleep(5 * time.Second)
+				time.Sleep(30 * time.Second)
 			}
 		}
 	case "setup":
@@ -525,6 +687,7 @@ func main() {
 			0644,
 		)
 		Run("sysctl -w fs.file-max=1048576")
+
 		if code := RunWithExit(fmt.Sprintf("groupadd -g %d app", appUID)); code != 0 && code != 9 {
 			fatal("failed to create group")
 		}
@@ -532,12 +695,7 @@ func main() {
 			fatal("failed to create user")
 		}
 
-		state, err := engineer.GetState(c, bucket)
-		V(err)
-		j, err := json.Marshal(state)
-		V(err)
-		fetchVersion(c, bucket, state.Version)
-		V(ioutil.WriteFile(localStatePath, j, 0644))
+		V(fetchVersion(c, bucket, getAppVersion()))
 
 		unitFile := `[Unit]
 	Description=Engineer Agent
@@ -548,7 +706,6 @@ func main() {
 	Restart=always
 	RestartSec=30
 	LimitNOFILE=1048576
-	User=app
 	KillMode=process
 	TimeoutStopSec=95s
 
@@ -560,49 +717,6 @@ func main() {
 		Run("systemctl enable /agent/agent.service")
 		Run("systemctl daemon-reload")
 		Run("systemctl start agent.service")
-	case "update":
-		state, err := engineer.GetState(c, bucket)
-		V(err)
-		fetchVersion(c, bucket, state.Version)
-		j, err := json.Marshal(state)
-		V(err)
-		V(ioutil.WriteFile(localStatePath, j, 0644))
-		sendMessage("update")
-	case "status":
-		status := struct {
-			InstanceUptime time.Duration
-			AppUptime      time.Duration
-			AppVersion     int
-		}{}
-
-		{
-			contents, err := ioutil.ReadFile("/proc/uptime")
-			V(err)
-
-			parts := strings.Split(string(contents), " ")
-			f, err := strconv.ParseFloat(parts[0], 64)
-			V(err)
-			status.InstanceUptime = time.Duration(f) * time.Second
-		}
-
-		{
-			contents, err := ioutil.ReadFile(localStatePath)
-			V(err)
-			state := engineer.State{}
-			V(json.Unmarshal(contents, &state))
-			status.AppVersion = state.Version
-		}
-
-		{
-			response := sendMessage("uptime")
-			i, err := strconv.Atoi(response)
-			V(err)
-			status.AppUptime = time.Duration(i) * time.Second
-		}
-
-		j, err := json.Marshal(status)
-		V(err)
-		fmt.Println(string(j))
 	default:
 		fatal("invalid action=" + action)
 	}

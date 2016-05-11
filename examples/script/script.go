@@ -1,37 +1,5 @@
 package main
 
-/*
-
-Script Example
-
-1. Create a deployment and app in your engr.json such as:
-
-{
-  "Deployments": {
-    "dev": {
-      "Project": "<project name>",
-      "Zone": "us-central1-c"
-    }
-  },
-	"Apps": {
-		"environ": {
-			"Executable": "github.com/pushbullet/engineer/examples/environ",
-			"Tags": ["http-server"]
-		},
-	}
-}
-
-2. Deploy the app with "engr dev environ deploy"
-
-3. Run this script
-
-	> go install engineer/examples/script
-	> engr dev environ run bin/script
-
-4. Run "engr dev environ destroy" to remove all created resources
-
-*/
-
 import (
 	"fmt"
 	"log"

@@ -1,48 +1,31 @@
 package main
 
-/*
-
-Environment Example
-
-1. Deploy this by adding the following to engr.json and running "engr dev environ deploy":
-
-{
-  "Deployments": {
-    "dev": {
-      "Project": "<project name>",
-      "Zone": "us-central1-c"
-    }
-  },
-	"Apps": {
-		"environ": {
-			"Executable": "github.com/pushbullet/engineer/examples/environ",
-			"Tags": ["http-server"]
-		}
-	}
-}
-
-2. Find the IP address by using "engr dev environ status"
-3. Run "curl http://<ip address>/"
-4. Run "engr dev environ setenv cats meow"
-5. Run "curl http://<ip address>/" and you should see the updated environment
-6. Run "engr dev environ destroy" to remove all created resources
-
-*/
-
 import (
 	"fmt"
 	"net/http"
 	"os"
+
+	"github.com/pushbullet/engineer"
 )
 
 func main() {
 	fmt.Println("started")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "cats: %+v\n", os.Getenv("cats"))
+		cats := os.Getenv("cats")
+		if cats == "" {
+			cats = "<unset>"
+		}
+		fmt.Fprintf(w, "Engineer example app!\nCurrent cats level: %+v\n", cats)
 	})
 
-	if err := http.ListenAndServe(":80", nil); err != nil {
-		panic(err)
+	if engineer.Development() {
+		if err := http.ListenAndServe("127.0.0.1:8080", nil); err != nil {
+			panic(err)
+		}
+	} else {
+		if err := http.ListenAndServe(":80", nil); err != nil {
+			panic(err)
+		}
 	}
 }
