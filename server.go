@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func ListenAndServe(addr string, handler http.Handler) error {
@@ -47,7 +48,9 @@ func ListenAndServeTLS(addr string, cert, key string, handler http.Handler) erro
 }
 
 func serveUntilTerminate(listener net.Listener, handler http.Handler) error {
-	server := &http.Server{Handler: handler}
+	// https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
+	// writeTimeout is different with HTTPS so use 60 seconds instead of 30
+	server := &http.Server{Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
 
 	sigterm := make(chan os.Signal, 1)
 	signal.Notify(sigterm, syscall.SIGTERM)
