@@ -21,23 +21,25 @@ import (
 
 	"gopkg.in/fsnotify.v1"
 
+	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 	rawpubsub "google.golang.org/api/pubsub/v1"
 	rawstorage "google.golang.org/api/storage/v1"
-	"google.golang.org/cloud"
-	"google.golang.org/cloud/storage"
 )
 
-var ctx context.Context
+var ctx context.Context = context.Background()
 var gcps *rawpubsub.Service
 var gcs *rawstorage.Service
 var gce *compute.Service
 var storageClient *storage.Client
+var pubsubClient *pubsub.Client
 var showLogPrefix = false
 
 const (
@@ -223,7 +225,7 @@ func runApp(app internal.App) chan bool {
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				fmt.Printf(Green + "[" + app.Name + "] " + scanner.Text() + Reset + "\n")
+				fmt.Print(Green + "[" + app.Name + "] " + scanner.Text() + Reset + "\n")
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -232,7 +234,7 @@ func runApp(app internal.App) chan bool {
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				fmt.Printf(Red + "[" + app.Name + "] ERROR: " + scanner.Text() + Reset + "\n")
+				fmt.Print(Red + "[" + app.Name + "] ERROR: " + scanner.Text() + Reset + "\n")
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -431,7 +433,7 @@ func gcsVersionCopy(app internal.App, oldVersion int, newVersion int, name strin
 	dstName := strconv.Itoa(newVersion) + "/" + name
 	dst := storageClient.Bucket(app.Bucket()).Object(dstName)
 	start := time.Now()
-	_, err := src.CopyTo(ctx, dst, nil)
+	_, err := dst.CopierFrom(src).Run(ctx)
 	V(err)
 	infof("copied gcs file src=gs://%s/%s dst=gs://%s/%s in %.2fs", app.Bucket(), srcName, app.Bucket(), dstName, time.Now().Sub(start).Seconds())
 }
@@ -537,7 +539,7 @@ func runCommand(cmd Command) {
 		switch cmd.Name {
 		case "deploy", "env:set", "env:unset", "status", "rollback":
 			// prepare an RPC subscription for these commands
-			go PrepareRPC(ctx, app.Name)
+			go PrepareRPC(ctx, app.Name, pubsubClient)
 		}
 	}
 
@@ -578,16 +580,14 @@ func runCommand(cmd Command) {
 		if bucketExists && ask("destroy the bucket "+app.Bucket()+"?", false) {
 			infof("destroying bucket name=%s", app.Bucket())
 			var query *storage.Query
+			iter := bucket.Objects(ctx, query)
 			for {
-				objects, err := bucket.List(ctx, query)
-				V(err)
-				for _, object := range objects.Results {
-					bucket.Object(object.Name).Delete(ctx)
-				}
-				query = objects.Next
-				if query == nil {
+				object, err := iter.Next()
+				if err == iterator.Done {
 					break
 				}
+				V(err)
+				bucket.Object(object.Name).Delete(ctx)
 			}
 			V(gcs.Buckets.Delete(app.Bucket()).Do())
 		}
@@ -699,7 +699,7 @@ func runCommand(cmd Command) {
 
 			infof("\ninstance status")
 			tc, _ := context.WithTimeout(ctx, 15*time.Second)
-			msgs, err := RPC(tc, app.Name, internal.CommandStatus, 0, len(getInstances(app, igm.Name)))
+			msgs, err := RPC(tc, app.Name, internal.CommandStatus, 0, len(getInstances(app, igm.Name)), pubsubClient)
 			if err != context.DeadlineExceeded {
 				V(err)
 			}
@@ -765,10 +765,10 @@ func runCommand(cmd Command) {
 			infof("%s=%s", k, env[k])
 		case "env:set", "env:unset":
 			key := cmd.Args[0]
-			value := cmd.Args[1]
+			value := ""
 
-			if cmd.Name == "env:unset" {
-				value = ""
+			if cmd.Name != "env:unset" {
+				value = cmd.Args[1]
 			}
 
 			if strings.HasPrefix(value, "@") {
@@ -1113,8 +1113,10 @@ Command must be one of:
 			exitf("google account does not seem to work, try running `gcloud auth login`\nerr=%v", err)
 		}
 
-		ctx = cloud.NewContext(cmd.App.Project, client)
 		storageClient, err = storage.NewClient(ctx)
+		V(err)
+
+		pubsubClient, err = pubsub.NewClient(ctx, cmd.App.Project)
 		V(err)
 	}
 

@@ -17,10 +17,9 @@ import (
 
 	"github.com/pushbullet/engineer/internal"
 
+	"cloud.google.com/go/storage"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
-	"google.golang.org/cloud/pubsub"
-	"google.golang.org/cloud/storage"
 )
 
 func retry(f func() error, minPeriod time.Duration, timeout time.Duration) error {
@@ -119,12 +118,13 @@ func createGlobalResources(app internal.App) {
 	region := app.Region()
 
 	{
-		name := app.Topic()
-		exists, err := pubsub.TopicExists(ctx, name)
+		topic := internal.TopicFromAppName(pubsubClient, app.Name)
+		exists, err := topic.Exists(ctx)
 		V(err)
 		if !exists {
-			infof("creating topic %s", name)
-			V(pubsub.CreateTopic(ctx, name))
+			infof("creating topic %s", topic.ID())
+			_, err := pubsubClient.CreateTopic(ctx, topic.ID())
+			V(err)
 		}
 	}
 
@@ -213,19 +213,19 @@ func createGlobalResources(app internal.App) {
 
 func destroyGlobalResources(app internal.App) {
 	{
-		name := app.Topic()
-		exists, err := pubsub.TopicExists(ctx, name)
+		topic := internal.TopicFromAppName(pubsubClient, app.Name)
+		exists, err := topic.Exists(ctx)
 		V(err)
 		if exists {
-			infof("destroying topic %s", name)
-			V(pubsub.DeleteTopic(ctx, name))
+			infof("destroying topic %s", topic.ID())
+			V(topic.Delete(ctx))
 		}
 	}
 
 	{
 		name := app.ForwardingRule()
 		if resourceExists(gce.ForwardingRules.Get(app.Project, app.Region(), name).Do()) {
-			infof("creating forwarding rule %s", name)
+			infof("destroying forwarding rule %s", name)
 			wait(gce.ForwardingRules.Delete(app.Project, app.Region(), name).Do())
 		}
 	}
@@ -297,19 +297,19 @@ func generateScopes(app internal.App) []string {
 
 func generateStartupScript(app internal.App) string {
 	return fmt.Sprintf(`#!/bin/sh
-	# retry setup every 30 seconds until successful
-	while true
-	do
-	mkdir /agent
-	gsutil cp gs://%s/agent-%s /agent/agent
-	chmod +x /agent/agent
-	/agent/agent setup
-	if [ $? -eq 0 ]
-	then
-	exit 0
-	fi
-	sleep 30
-	done`, app.Bucket(), agentVersion)
+# retry setup every 30 seconds until successful
+while true
+do
+mkdir /agent
+gsutil cp gs://%s/agent-%s /agent/agent
+chmod +x /agent/agent
+/agent/agent setup
+if [ $? -eq 0 ]
+then
+exit 0
+fi
+sleep 30
+done`, app.Bucket(), agentVersion)
 }
 
 func uploadAgent(app internal.App) {
@@ -601,7 +601,7 @@ func deployApp(app internal.App, version int) {
 			infof("updating %d instances", count)
 
 			tc, _ := context.WithTimeout(ctx, 15*time.Second)
-			msgs, err := RPC(tc, app.Name, internal.CommandUpdate, version, count)
+			msgs, err := RPC(tc, app.Name, internal.CommandUpdate, version, count, pubsubClient)
 			if err == context.DeadlineExceeded {
 				errorf("timed out waiting for some responses")
 			} else {

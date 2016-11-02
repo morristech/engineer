@@ -1,3 +1,3 @@
 package main
 
-var agentVersion = "d045519e"
+var agentVersion = "89fa5d25"

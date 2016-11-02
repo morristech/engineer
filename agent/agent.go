@@ -20,16 +20,14 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc/grpclog"
+
+	"cloud.google.com/go/compute/metadata"
+	"cloud.google.com/go/logging"
+	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/googleapi"
-	"google.golang.org/cloud"
-	"google.golang.org/cloud/compute/metadata"
-	"google.golang.org/cloud/logging"
-	"google.golang.org/cloud/pubsub"
-	"google.golang.org/cloud/storage"
 )
 
 const (
@@ -38,12 +36,13 @@ const (
 )
 
 var (
-	logger  *logging.Client
-	appName string
-	project string
+	logger       *logging.Logger
+	pubsubClient *pubsub.Client
+	appName      string
+	project      string
 )
 
-func log(level logging.Level, prefix string, message string, labels map[string]string) {
+func _log(severity logging.Severity, prefix string, message string, labels map[string]string) {
 	if strings.HasPrefix(message, "http: TLS handshake error from ") {
 		// there's a bunch of these caused by HTTPS port scanners, so just discard these in production
 		// https://groups.google.com/forum/#!topic/golang-nuts/d4sjZR7H4gU
@@ -52,7 +51,7 @@ func log(level logging.Level, prefix string, message string, labels map[string]s
 
 	if logger == nil {
 		printMessage := message
-		if level == logging.Error {
+		if severity == logging.Error {
 			printMessage = "ERROR: " + message
 		}
 		fmt.Println("[" + prefix + "] " + printMessage)
@@ -61,22 +60,19 @@ func log(level logging.Level, prefix string, message string, labels map[string]s
 
 	hostname, _ := os.Hostname()
 
-	err := logger.Log(logging.Entry{
-		Level:   level,
-		Payload: fmt.Sprintf("%s[%s]: %s", prefix, hostname, message),
-		Labels:  labels,
+	logger.Log(logging.Entry{
+		Severity: severity,
+		Payload:  fmt.Sprintf("%s[%s]: %s", prefix, hostname, message),
+		Labels:   labels,
 	})
-	if err != nil {
-		fmt.Println("logging failed:", err)
-	}
 }
 
 func infof(f string, args ...interface{}) {
-	log(logging.Info, "agent", fmt.Sprintf(f, args...), nil)
+	_log(logging.Info, "agent", fmt.Sprintf(f, args...), nil)
 }
 
 func errorf(f string, args ...interface{}) {
-	log(logging.Error, "agent", fmt.Sprintf(f, args...), nil)
+	_log(logging.Error, "agent", fmt.Sprintf(f, args...), nil)
 }
 
 func fatal(v interface{}) {
@@ -86,11 +82,40 @@ func fatal(v interface{}) {
 
 func exit(code int) {
 	if logger != nil {
-		if err := logger.Flush(); err != nil {
-			fmt.Println("failed to flush logs:", err)
-		}
+		logger.Flush()
 	}
 	os.Exit(code)
+}
+
+type LogConverter struct {
+	logger *logging.Logger
+}
+
+func (lc *LogConverter) Fatal(args ...interface{}) {
+	_log(logging.Error, "agent", fmt.Sprint(args...), nil)
+	exit(1)
+}
+
+func (lc *LogConverter) Fatalf(format string, args ...interface{}) {
+	_log(logging.Error, "agent", fmt.Sprintf(format, args...), nil)
+	exit(1)
+}
+
+func (lc *LogConverter) Fatalln(args ...interface{}) {
+	_log(logging.Error, "agent", fmt.Sprintln(args...), nil)
+	exit(1)
+}
+
+func (lc *LogConverter) Print(args ...interface{}) {
+	_log(logging.Info, "agent", fmt.Sprint(args...), nil)
+}
+
+func (lc *LogConverter) Printf(format string, args ...interface{}) {
+	_log(logging.Info, "agent", fmt.Sprintf(format, args...), nil)
+}
+
+func (lc *LogConverter) Println(args ...interface{}) {
+	_log(logging.Info, "agent", fmt.Sprintln(args...), nil)
 }
 
 func V(err error) {
@@ -163,7 +188,7 @@ func fetchVersion(c context.Context, bucketName string, version int) error {
 	bucket := client.Bucket(bucketName)
 
 	if !Exists(dir) {
-		infof("reading package")
+		infof("extracting package")
 		r, err := bucket.Object(versionName + "/package.zip").NewReader(c)
 		if err != nil {
 			return err
@@ -178,7 +203,6 @@ func fetchVersion(c context.Context, bucketName string, version int) error {
 		}
 
 		for _, f := range z.File {
-			infof("extracting file %s", f.Name)
 			input, err := f.Open()
 			if err != nil {
 				return err
@@ -361,7 +385,7 @@ func startVersion(version int) (*AppProcess, error) {
 			defer wg.Done()
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				log(logging.Info, appName, scanner.Text(), labels)
+				_log(logging.Info, appName, scanner.Text(), labels)
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -378,7 +402,7 @@ func startVersion(version int) (*AppProcess, error) {
 					// the debugger takes stdout from the child process and reroutes it to stderr
 					level = logging.Info
 				}
-				log(level, appName, scanner.Text(), labels)
+				_log(level, appName, scanner.Text(), labels)
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -391,47 +415,6 @@ func startVersion(version int) (*AppProcess, error) {
 	}()
 
 	return ap, nil
-}
-
-func ReceiveMessage(c context.Context, appName string, sub string) (*internal.Message, error) {
-	topic := internal.TopicFromAppName(appName)
-
-	m, err := receiveMessage(c, topic, sub)
-	if err != nil {
-		if e, ok := err.(*googleapi.Error); ok && e.Code == 404 {
-			if err := pubsub.CreateSub(c, sub, topic, 10*time.Second, ""); err != nil {
-				return nil, err
-			}
-			return receiveMessage(c, topic, sub)
-		}
-		return nil, err
-	}
-
-	return m, nil
-}
-
-func receiveMessage(c context.Context, topic, sub string) (*internal.Message, error) {
-	msgs, err := pubsub.PullWait(c, sub, 1)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(msgs) == 0 {
-		return nil, nil
-	}
-
-	msg := msgs[0]
-
-	if err := pubsub.Ack(c, sub, msg.AckID); err != nil {
-		return nil, err
-	}
-
-	m := internal.Message{}
-	if err := json.Unmarshal(msg.Data, &m); err != nil {
-		return nil, err
-	}
-
-	return &m, nil
 }
 
 func updateCall(c context.Context, bucket string, version int) error {
@@ -491,22 +474,23 @@ func main() {
 	instance, err := metadata.InstanceName()
 	V(err)
 
-	client := &http.Client{
-		Transport: &oauth2.Transport{
-			Source: google.ComputeTokenSource(""),
-		},
-	}
-	c := cloud.NewContext(project, client)
+	c := context.Background()
 
-	// https://godoc.org/google.golang.org/cloud/logging
-	logger, err = logging.NewClient(c, project, "engineer", cloud.WithTokenSource(google.ComputeTokenSource("")))
+	loggingClient, err := logging.NewClient(c, project)
 	V(err)
-	logger.CommonLabels = map[string]string{
+
+	commonLabels := map[string]string{
 		// special keys for filtering in the cloud console log viewer
 		"custom.googleapis.com/primary_key": appName,
 		"app":      appName,
 		"instance": instance,
 	}
+	logger = loggingClient.Logger("engineer", logging.CommonLabels(commonLabels))
+
+	grpclog.SetLogger(&LogConverter{logger})
+
+	pubsubClient, err = pubsub.NewClient(c, project)
+	V(err)
 
 	if len(os.Args) != 2 {
 		fatal("invalid args")
@@ -528,19 +512,38 @@ func main() {
 		var running bool
 		var offline bool
 
-		go func() {
+		processMessages := func() error {
+			topic := internal.TopicFromAppName(pubsubClient, appName)
+			sub := pubsubClient.Subscription(instance)
+
+			exists, err := sub.Exists(c)
+			if err != nil {
+				return err
+			}
+
+			if !exists {
+				if _, err := pubsubClient.CreateSubscription(c, sub.ID(), topic, 10*time.Second, nil); err != nil {
+					return err
+				}
+			}
+
+			it, err := sub.Pull(c)
+			if err != nil {
+				return err
+			}
+			defer it.Stop()
+
 			for {
-				// will timeout after about 90 seconds on the remote side
-				m, err := ReceiveMessage(c, appName, instance)
+				msg, err := it.Next()
 				if err != nil {
-					errorf("receive error=%v", err)
-					time.Sleep(30 * time.Second)
-					continue
+					return err
 				}
 
-				if m == nil {
-					// didn't get a message
-					continue
+				msg.Done(true)
+
+				m := internal.Message{}
+				if err := json.Unmarshal(msg.Data, &m); err != nil {
+					return err
 				}
 
 				if m.Published.Add(60 * time.Second).Before(time.Now()) {
@@ -551,13 +554,18 @@ func main() {
 				reply := func(c context.Context, resp internal.Message) {
 					resp.RequestID = m.RequestID
 					resp.Instance = instance
-					if err := internal.SendMessage(c, appName, resp); err != nil {
+					if err := internal.SendMessage(c, resp, topic); err != nil {
 						errorf("send error=%v", err)
 					}
 				}
 
 				switch m.Command {
 				case internal.CommandUpdate:
+					if m.UpdateVersion == getAppVersion() {
+						reply(c, internal.Message{})
+						infof("already running requested version")
+						continue
+					}
 					if err := updateCall(c, bucket, m.UpdateVersion); err != nil {
 						reply(c, internal.Message{Error: err.Error()})
 						continue
@@ -583,6 +591,13 @@ func main() {
 				default:
 					// replies will show up here, since we use just a single topic
 				}
+			}
+		}
+
+		go func() {
+			for {
+				errorf("message error=%v", processMessages())
+				time.Sleep(1 * time.Minute)
 			}
 		}()
 
@@ -649,7 +664,7 @@ func main() {
 				infof("shutting down in 60 seconds")
 				time.Sleep(60 * time.Second)
 				infof("shutting down")
-				pubsub.DeleteTopic(c, instance)
+				pubsubClient.Topic(instance).Delete(c)
 				exit(0)
 			case <-update:
 				infof("updating")
@@ -698,20 +713,20 @@ func main() {
 		V(fetchVersion(c, bucket, getAppVersion()))
 
 		unitFile := `[Unit]
-	Description=Engineer Agent
+Description=Engineer Agent
 
-	[Service]
-	ExecStart=/agent/agent run
-	WorkingDirectory=/agent
-	Restart=always
-	RestartSec=30
-	LimitNOFILE=1048576
-	KillMode=process
-	TimeoutStopSec=95s
+[Service]
+ExecStart=/agent/agent run
+WorkingDirectory=/agent
+Restart=always
+RestartSec=30
+LimitNOFILE=1048576
+KillMode=process
+TimeoutStopSec=95s
 
-	[Install]
-	WantedBy=multi-user.target
-	`
+[Install]
+WantedBy=multi-user.target
+`
 
 		V(ioutil.WriteFile("/agent/agent.service", []byte(unitFile), 0644))
 		Run("systemctl enable /agent/agent.service")

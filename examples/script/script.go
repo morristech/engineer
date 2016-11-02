@@ -4,43 +4,33 @@ import (
 	"fmt"
 	"log"
 
+	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer"
 	"golang.org/x/net/context"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/cloud"
-	"google.golang.org/cloud/storage"
+	"google.golang.org/api/iterator"
 )
 
 func main() {
 	c := context.Background()
-
-	client, err := google.DefaultClient(c, "https://www.googleapis.com/auth/devstorage.read_only")
-	if err != nil {
-		panic(err)
-	}
-
-	c = cloud.WithContext(c, engineer.Project(), client)
-
 	storageClient, err := storage.NewClient(c)
 	if err != nil {
 		panic(err)
 	}
 
-	bucketName := engineer.Project() + "-dev-" + engineer.AppName()
+	bucketName := engineer.Project() + "-" + engineer.AppName()
 	fmt.Println("bucket:", bucketName)
 
 	var query *storage.Query
+
+	iter := storageClient.Bucket(bucketName).Objects(c, query)
 	for {
-		objects, err := storageClient.Bucket(bucketName).List(c, query)
+		obj, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
 		if err != nil {
 			log.Fatal(err)
 		}
-		for _, obj := range objects.Results {
-			fmt.Printf("object name: %s, size: %v\n", obj.Name, obj.Size)
-		}
-		query = objects.Next
-		if query == nil {
-			break
-		}
+		fmt.Printf("object name: %s, size: %v\n", obj.Name, obj.Size)
 	}
 }

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/pubsub"
 	"golang.org/x/net/context"
-	"google.golang.org/cloud/pubsub"
 )
 
 type StatusResult struct {
@@ -35,13 +35,11 @@ const (
 	CommandStatus         = "status"
 )
 
-func TopicFromAppName(appName string) string {
-	return appName + "-topic"
+func TopicFromAppName(pubsubClient *pubsub.Client, appName string) *pubsub.Topic {
+	return pubsubClient.Topic(appName + "-topic")
 }
 
-func SendMessage(c context.Context, appName string, message Message) error {
-	topic := TopicFromAppName(appName)
-
+func SendMessage(c context.Context, message Message, topic *pubsub.Topic) error {
 	message.Published = time.Now().UTC()
 
 	j, err := json.Marshal(message)
@@ -52,7 +50,7 @@ func SendMessage(c context.Context, appName string, message Message) error {
 		Data: []byte(j),
 	}
 
-	_, err = pubsub.Publish(c, topic, pm)
+	_, err = topic.Publish(c, pm)
 	if err != nil {
 		return err
 	}
@@ -120,8 +118,4 @@ func (a *App) Bucket() string {
 func (a *App) Region() string {
 	parts := strings.Split(a.Zone, "-")
 	return strings.Join(parts[:len(parts)-1], "-")
-}
-
-func (a *App) Topic() string {
-	return TopicFromAppName(a.Name)
 }
