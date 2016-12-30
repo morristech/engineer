@@ -19,25 +19,28 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/fsnotify.v1"
-
 	"cloud.google.com/go/pubsub"
 	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/compute/v1"
+	cloudresourcemanager "google.golang.org/api/cloudresourcemanager/v1"
+	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	rawiam "google.golang.org/api/iam/v1"
 	"google.golang.org/api/iterator"
 	rawpubsub "google.golang.org/api/pubsub/v1"
 	rawstorage "google.golang.org/api/storage/v1"
+	fsnotify "gopkg.in/fsnotify.v1"
 )
 
 var ctx context.Context = context.Background()
 var gcps *rawpubsub.Service
 var gcs *rawstorage.Service
 var gce *compute.Service
+var iam *rawiam.Service
+var crm *cloudresourcemanager.Service
 var storageClient *storage.Client
 var pubsubClient *pubsub.Client
 var showLogPrefix = false
@@ -537,7 +540,7 @@ func runCommand(cmd Command) {
 
 	if !app.StagedDeploy {
 		switch cmd.Name {
-		case "deploy", "env:set", "env:unset", "status", "rollback":
+		case "deploy", "env:set", "env:unset", "status", "rollback": //, "offline":
 			// prepare an RPC subscription for these commands
 			go PrepareRPC(ctx, app.Name, pubsubClient)
 		}
@@ -575,6 +578,12 @@ func runCommand(cmd Command) {
 
 		destroyGlobalResources(app)
 
+		if resourceExists(iam.Projects.ServiceAccounts.Get(app.ServiceAccountName()).Do()) {
+			infof("destroying service account name=%s", app.ServiceAccount())
+			_, err := iam.Projects.ServiceAccounts.Delete(app.ServiceAccountName()).Do()
+			V(err)
+		}
+
 		// delete all items then delete the bucket
 		// (bucket cannot be deleted unless all items are deleted, at least with this delete call)
 		if bucketExists && ask("destroy the bucket "+app.Bucket()+"?", false) {
@@ -601,10 +610,24 @@ func runCommand(cmd Command) {
 				return
 			}
 			infof("creating environment name=%s project=%s", app.Name, app.Project)
+
+			// https://cloud.google.com/compute/docs/access/service-accounts#service_account_permissions
+			if !resourceExists(iam.Projects.ServiceAccounts.Get(app.ServiceAccountName()).Do()) {
+				infof("creating service account name=%s", app.ServiceAccount())
+				_, err := iam.Projects.ServiceAccounts.Create("projects/"+app.Project, &rawiam.CreateServiceAccountRequest{AccountId: app.ServiceAccount(), ServiceAccount: &rawiam.ServiceAccount{DisplayName: app.ServiceAccount()}}).Do()
+				V(err)
+			}
+
 			infof("creating bucket name=%s", app.Bucket())
 			_, err := gcs.Buckets.Insert(app.Project, &rawstorage.Bucket{Name: app.Bucket()}).Do()
 			V(err)
 			gcsWrite(app, "state.json", strings.NewReader("{}"))
+
+			_, err = gcs.BucketAccessControls.Insert(app.Bucket(), &rawstorage.BucketAccessControl{Entity: "user-" + app.ServiceAccountEmail(), Role: "READER"}).Do()
+			V(err)
+
+			_, err = gcs.DefaultObjectAccessControls.Insert(app.Bucket(), &rawstorage.ObjectAccessControl{Entity: "user-" + app.ServiceAccountEmail(), Role: "READER"}).Do()
+			V(err)
 		}
 
 		infof("getting state")
@@ -649,6 +672,7 @@ func runCommand(cmd Command) {
 		infof("updating state")
 		V(putState(ctx, app.Bucket(), state))
 
+		updateRoles(app)
 		deployApp(app, state.Version)
 
 		infof("deployed version=%d", state.Version)
@@ -719,7 +743,7 @@ func runCommand(cmd Command) {
 
 				if app.Server {
 					health, err := gce.TargetPools.GetHealth(app.Project, app.Region(), app.TargetPool(), &compute.InstanceReference{Instance: instance.Instance}).Do()
-					if err == nil {
+					if err == nil && len(health.HealthStatus) > 0 {
 						infof(instanceName+"[health]=%+v", health.HealthStatus[0].HealthState)
 					} else {
 						infof(instanceName + "[health]=UNKNOWN")
@@ -764,26 +788,29 @@ func runCommand(cmd Command) {
 			k := cmd.Args[0]
 			infof("%s=%s", k, env[k])
 		case "env:set", "env:unset":
-			key := cmd.Args[0]
-			value := ""
-
-			if cmd.Name != "env:unset" {
-				value = cmd.Args[1]
+			if len(cmd.Args) == 0 {
+				exitf("you must specify a key")
 			}
 
-			if strings.HasPrefix(value, "@") {
-				// load from file
-				contents, err := ioutil.ReadFile(value[1:])
-				V(err)
-				value = string(contents)
-			}
-			if value == "" {
-				delete(env, key)
+			if cmd.Name == "env:set" {
+				for i := 0; i < len(cmd.Args); i += 2 {
+					key := cmd.Args[i]
+					value := cmd.Args[i+1]
+					if strings.HasPrefix(value, "@") {
+						// load from file
+						contents, err := ioutil.ReadFile(value[1:])
+						V(err)
+						value = string(contents)
+					}
+					env[key] = value
+					infof("%s=%s", key, value)
+				}
 			} else {
-				env[key] = value
+				for _, key := range cmd.Args {
+					delete(env, key)
+					infof("%s=<unset>", key)
+				}
 			}
-
-			infof("%s=%s", key, value)
 
 			infof("updating state")
 			state.Version++
@@ -857,6 +884,10 @@ func runCommand(cmd Command) {
 		version, err := strconv.Atoi(cmd.Args[0])
 		V(err)
 		destroyInstanceGroup(app, app.InstanceGroup(version))
+	// case "offline":
+	// 	version, err := strconv.Atoi(cmd.Args[0])
+	// 	V(err)
+	// 	offlineInstanceGroup(app, app.InstanceGroup(version))
 	default:
 		exitf("invalid command=%s", cmd.Name)
 	}
@@ -917,7 +948,7 @@ Command must be one of:
 			config.Apps[appName] = internal.App{
 				Package:       "github.com/pushbullet/engineer/examples/environ",
 				Server:        true,
-				Scopes:        []string{},
+				Roles:         []string{},
 				Tags:          []string{"http-server"},
 				Zone:          "us-central1-c",
 				InstanceCount: 1,
@@ -968,8 +999,8 @@ Command must be one of:
 				infof("debug=%v", app.Debug)
 			case "graceful-shutdown":
 				infof("graceful-shutdown=%v", app.GracefulShutdown)
-			case "scopes":
-				infof("scopes=%s", strings.Join(app.Scopes, " "))
+			case "roles":
+				infof("roles=%s", strings.Join(app.Roles, " "))
 			case "tags":
 				infof("tags=%s", strings.Join(app.Tags, " "))
 			case "instance-count":
@@ -997,7 +1028,7 @@ Command must be one of:
 			infof("server=%v", app.Server)
 			infof("debug=%v", app.Debug)
 			infof("graceful-shutdown=%v", app.GracefulShutdown)
-			infof("scopes=%s", strings.Join(app.Scopes, " "))
+			infof("roles=%s", strings.Join(app.Roles, " "))
 			infof("tags=%s", strings.Join(app.Tags, " "))
 			infof("instance-count=%d", app.InstanceCount)
 			infof("machine-type=%s", app.MachineType)
@@ -1028,14 +1059,14 @@ Command must be one of:
 				app.Debug = values[0] == "true"
 			case "graceful-shutdown":
 				app.GracefulShutdown = values[0] == "true"
-			case "scopes":
-				scopes := []string{}
+			case "roles":
+				roles := []string{}
 				for _, v := range values {
 					if v != "" {
-						scopes = append(scopes, v)
+						roles = append(roles, v)
 					}
 				}
-				app.Scopes = scopes
+				app.Roles = roles
 			case "tags":
 				tags := []string{}
 				for _, v := range values {
@@ -1106,6 +1137,10 @@ Command must be one of:
 		gcs, err = rawstorage.New(client)
 		V(err)
 		gcps, err = rawpubsub.New(client)
+		V(err)
+		iam, err = rawiam.New(client)
+		V(err)
+		crm, err = cloudresourcemanager.New(client)
 		V(err)
 
 		// do a test request to see if our token is good

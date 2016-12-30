@@ -33,6 +33,7 @@ type Command string
 const (
 	CommandUpdate Command = "update"
 	CommandStatus         = "status"
+	// CommandOffline         = "offline"
 )
 
 func TopicFromAppName(pubsubClient *pubsub.Client, appName string) *pubsub.Topic {
@@ -63,7 +64,7 @@ type App struct {
 	Server           bool     `json:"server"`
 	Debug            bool     `json:"debug"`
 	GracefulShutdown bool     `json:"graceful-shutdown"`
-	Scopes           []string `json:"scopes"`
+	Roles            []string `json:"roles"`
 	Tags             []string `json:"tags"`
 	InstanceCount    int      `json:"instance-count"`
 	MachineType      string   `json:"machine-type"`
@@ -73,6 +74,18 @@ type App struct {
 	StagedDeploy     bool     `json:"staged-deploy"`
 	Generate         bool     `json:"generate"`
 	Local            bool     `json:"-"`
+}
+
+func (a *App) ServiceAccount() string {
+	return fmt.Sprintf("%s-account", a.Name)
+}
+
+func (a *App) ServiceAccountEmail() string {
+	return fmt.Sprintf("%s@%s.iam.gserviceaccount.com", a.ServiceAccount(), a.Project)
+}
+
+func (a *App) ServiceAccountName() string {
+	return fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", a.Project, a.ServiceAccount(), a.Project)
 }
 
 func (a *App) TargetPool() string {

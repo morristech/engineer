@@ -20,9 +20,9 @@ Apps must be Go executables and are run directly on GCE instances.  Each instanc
 * inspired by heroku + http://12factor.net/
 * Go only
 * depends on GCE and GCS
-* deploys, rollbacks, and environment changes are quick (~10s with fast internet connection)
-* other operations (such as sync) are slow (~3m)
-* with fancy deploys, you can not interrupt existing requests (`engr <app> config graceful_shutdown true`)
+* normal deploy operations are quick (~10s with fast internet connection)
+* if base image or agent version is changed, or other slow operation, deploy time is ~5m
+* with fancy deploys, you can not interrupt existing requests (`engr <app> config:set graceful-shutdown true`)
 * each app gets its own gcs bucket and 1 or more VMs, so each app requires at least an f1-micro instance (but those are pretty cheap)
 * supports Google Cloud Debugger
 * no build server (uses cross-compilation)
@@ -41,7 +41,8 @@ Apps must be Go executables and are run directly on GCE instances.  Each instanc
 
 # Getting Started
 ## Installation
-0. go get github.com/pushbullet/engineer/engr
+
+`go get github.com/pushbullet/engineer/engr`
 
 ## Authentication
 
@@ -63,39 +64,39 @@ Engineer is equivalent to running your own Go programs on GCE, so the same secur
 * Apps have decent isolation from each other because they run on different VMs
   * GCE has a default-allow-internal rule you can remove if you want
 * The base debian-8 image that is used for instances may not have the latest security updates, to get the latest, compile the image builder with `go install github.com/pushbullet/engineer/image-builder` and then build an image wtih  (`image-builder <project>`) to generate a base image, then set it as the default for your app in `engr.json` like `engr <app> config:set image engr-image-20160511t152353`, then run `engr <app> deploy` to update all instances to the newest base image.
-  * You can also run custom commands when setting up the image (using the `-script` argument), the default commands are `apt-get update` and `apt-get upgrade`
 
 # Operation
 ## Deployment
-`engr <app> deploy` builds your Go app and uploads it to the GCS bucket for the app under the current version number (stored in `state.json` in the bucket). `engr` then connects over SSH to each machine and runs `agent update` which will download the latest version and switch over to it.
+`engr <app> deploy` builds your Go app and uploads it to the GCS bucket for the app under the current version number (stored in `state.json` in the bucket). `engr` then tells each machine over Google Cloud Pub/Sub to download the latest version and switch over to it.
 
-## Sync
-`engr <app> sync` lists all GCE resources and compares them to the desired resources, creating or destroying resources as necessary.  If some property of the instance changes (machine type, agent version, etc) N new instances will be created with the new configuration, then the old instances will be destroyed.  Instances that are destroyed should have 60 seconds to finish processing requests/tasks after app receives `SIGTERM`, but this is not guaranteed.
+If the configuration of the app has changed, deploy will list all GCE resources and compares them to the desired resources, creating or destroying resources as necessary.  If some property of the instance changes (machine type, agent version, etc) N new instances will be created with the new configuration, then the old instances will be destroyed.  Instances that are destroyed should have 60 seconds to finish processing requests/tasks after app receives `SIGTERM`, but this is not guaranteed in all cases.
 
-# GracefulShutdown
-Each app can have `"GracefulShutdown": true` in its configuration in `engr.json`.  If this is set, the deploy process will attempt to upgrade to the new version with minimal downtime.
+# Graceful Shutdown
+Each app can have `"graceful-shutdown": true` in its configuration in `engr.json`.  If this is set, the deploy process will attempt to upgrade to the new version with minimal downtime.
 
-## `"GracefulShutdown": false`
+## `"graceful-shutdown": false`
 0. Old version of app is sent `SIGTERM`, if it doesn't die after 5 seconds, it is sent `SIGKILL`
 0. New version of app is started once old one dies
 
-## `"GracefulShutdown": true`
+## `"graceful-shutdown": true`
 0. New version of app is started
 0. After 5 seconds, old version of app will get `SIGTERM`, app is responsible for eventually dying, it is not killed
 
-NOTE: Both versions will receive traffic for some period of time between 5 seconds and when the old version stops accepting new connections
+In graceful shutdown mode, both versions will receive traffic for some period of time between 5 seconds and when the old version stops accepting new connections.  For this process to work, the graceful shutdown app must bind the socket with the `SO_REUSEPORT` option, which is done in `engineer.ListenAndServe()`, so that two versions of the app can share the same port.
 
-NOTE: For this process to work, the app must bind the socket with the `SO_REUSEPORT` option, which is done in `engineer.ListenAndServe()`, so that two versions of the app can share the same port.
+## How to use Graceful Shutdown
 
-## How to use GracefulShutdown
-
-### Server
 0. Catch the `SIGTERM` signal so your app doesn't die
-0. Stop listening for traffic
+0. Stop listening for traffic (not necessary for worker apps)
 0. Exit when requests are complete (ideally within 60 seconds in case instance is shutting down)
 
-NOTE: `engineer.ListenAndServe()` does steps 1 and 2
+## Example Usage
 
-### Worker
-0. Catch the `SIGTERM` signal so your app doesn't die
-0. Stop processing new tasks and exit (ideally within 60 seconds in case instance is shutting down)
+```
+if err := engineer.ListenAndServe(":443", nil); err != nil {
+  panic(err)
+}
+
+# if all requests terminate within 60 seconds, this should be sufficient
+time.Sleep(60 * time.Second)
+```

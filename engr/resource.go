@@ -13,14 +13,28 @@ import (
 	"strings"
 	"time"
 
+	cloudresourcemanager "google.golang.org/api/cloudresourcemanager/v1"
+	compute "google.golang.org/api/compute/v1"
+
 	"golang.org/x/net/context"
 
 	"github.com/pushbullet/engineer/internal"
 
 	"cloud.google.com/go/storage"
-	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 )
+
+func listsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func retry(f func() error, minPeriod time.Duration, timeout time.Duration) error {
 	var err error
@@ -125,6 +139,13 @@ func createGlobalResources(app internal.App) {
 			infof("creating topic %s", topic.ID())
 			_, err := pubsubClient.CreateTopic(ctx, topic.ID())
 			V(err)
+			policy, err := topic.IAM().Policy(ctx)
+			V(err)
+			// https://cloud.google.com/pubsub/docs/access_control
+			policy.Add("serviceAccount:"+app.ServiceAccountEmail(), "roles/pubsub.publisher")
+			policy.Add("serviceAccount:"+app.ServiceAccountEmail(), "roles/pubsub.subscriber")
+			policy.Add("serviceAccount:"+app.ServiceAccountEmail(), "roles/pubsub.viewer")
+			V(topic.IAM().SetPolicy(ctx, policy))
 		}
 	}
 
@@ -276,25 +297,6 @@ func getImageURL(app internal.App) string {
 	return ""
 }
 
-func generateScopes(app internal.App) []string {
-	scopes := []string{
-		"https://www.googleapis.com/auth/devstorage.read_only",
-		"https://www.googleapis.com/auth/pubsub",
-		"https://www.googleapis.com/auth/logging.write",
-	}
-
-	if app.Debug {
-		scopes = append(scopes, "https://www.googleapis.com/auth/cloud-platform")
-	}
-
-	if len(app.Scopes) > 0 {
-		for _, scope := range app.Scopes {
-			scopes = append(scopes, scope)
-		}
-	}
-	return scopes
-}
-
 func generateStartupScript(app internal.App) string {
 	return fmt.Sprintf(`#!/bin/sh
 # retry setup every 30 seconds until successful
@@ -343,7 +345,6 @@ func createInstanceGroup(app internal.App, version int, singleton bool) {
 
 	bucket := app.Bucket()
 
-	scopes := generateScopes(app)
 	startupScript := generateStartupScript(app)
 
 	tmpl := &compute.InstanceTemplate{
@@ -397,8 +398,8 @@ func createInstanceGroup(app internal.App, version int, singleton bool) {
 			Scheduling: &compute.Scheduling{AutomaticRestart: true},
 			ServiceAccounts: []*compute.ServiceAccount{
 				{
-					Email:  "default",
-					Scopes: scopes,
+					Email:  app.ServiceAccountEmail(),
+					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email"},
 				},
 			},
 		},
@@ -429,6 +430,14 @@ func createInstanceGroup(app internal.App, version int, singleton bool) {
 	wait(gce.InstanceGroupManagers.Insert(app.Project, app.Zone, instanceGroupManager).Do())
 	waitForInstanceGroup(app, instanceGroupManager.Name)
 }
+
+// func offlineInstanceGroup(app internal.App, name string) {
+// 	tc, _ := context.WithTimeout(ctx, 15*time.Second)
+// 	msgs, err := RPC(tc, app.Name, internal.CommandOffline, 0, len(getInstances(app, igm.Name)), pubsubClient)
+// 	if err != context.DeadlineExceeded {
+// 		V(err)
+// 	}
+// }
 
 func destroyInstanceGroup(app internal.App, name string) {
 	igm, err := gce.InstanceGroupManagers.Get(app.Project, app.Zone, name).Do()
@@ -501,30 +510,6 @@ func updateSingletonInstanceGroup(app internal.App, version int) {
 				item.Value = &startupScript
 			}
 		}
-	}
-
-	existingScopes := props.ServiceAccounts[0].Scopes
-	// compare scope lists as sets
-	sort.Strings(existingScopes)
-	scopes := generateScopes(app)
-	sort.Strings(scopes)
-
-	listsEqual := func(a, b []string) bool {
-		if len(a) != len(b) {
-			return false
-		}
-		for i := range a {
-			if a[i] != b[i] {
-				return false
-			}
-		}
-		return true
-	}
-
-	if !listsEqual(existingScopes, scopes) {
-		infof("changing scopes from %v to %v", existingScopes, scopes)
-		migrate = true
-		props.ServiceAccounts[0].Scopes = scopes
 	}
 
 	existingTags := []string{}
@@ -649,6 +634,68 @@ func deployApp(app internal.App, version int) {
 			infof("destroying instance group template %s", template.Name)
 		}
 	}
+}
+
+func updateRoles(app internal.App) {
+	policy, err := crm.Projects.GetIamPolicy(app.Project, &cloudresourcemanager.GetIamPolicyRequest{}).Do()
+	V(err)
+
+	// https://cloud.google.com/iam/docs/understanding-roles
+	defaultRoles := []string{
+		"roles/logging.logWriter",
+		"roles/pubsub.editor",
+	}
+
+	if app.Debug {
+		defaultRoles = append(defaultRoles, "roles/clouddebugger.agent")
+	}
+
+	roles := app.Roles
+	for _, role := range defaultRoles {
+		roles = append(roles, role)
+	}
+
+	existingRoles := []string{}
+
+	// remove all roles for the account, we will add them back below
+	for _, binding := range policy.Bindings {
+		for i, member := range binding.Members {
+			if member == "serviceAccount:"+app.ServiceAccountEmail() {
+				existingRoles = append(existingRoles, binding.Role)
+				binding.Members = append(binding.Members[:i], binding.Members[i+1:]...)
+				break
+			}
+		}
+	}
+
+	sort.Strings(roles)
+	sort.Strings(existingRoles)
+	if listsEqual(roles, existingRoles) {
+		return
+	}
+
+	// add all roles for this account
+	for _, role := range roles {
+		found := false
+		for _, binding := range policy.Bindings {
+			if binding.Role == role {
+				found = true
+				binding.Members = append(binding.Members, "serviceAccount:"+app.ServiceAccountEmail())
+			}
+		}
+
+		if !found {
+			binding := &cloudresourcemanager.Binding{
+				Members: []string{"serviceAccount:" + app.ServiceAccountEmail()},
+				Role:    role,
+			}
+			policy.Bindings = append(policy.Bindings, binding)
+		}
+	}
+
+	policyRequest := &cloudresourcemanager.SetIamPolicyRequest{Policy: policy}
+	_, err = crm.Projects.SetIamPolicy(app.Project, policyRequest).Do()
+	V(err)
 }
 
 func waitForInstanceGroup(app internal.App, name string) {

@@ -7,27 +7,25 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
-func ListenAndServe(addr string, handler http.Handler) error {
+func Listen(addr string) (net.Listener, error) {
 	listener, err := ListenReusable("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	return serveUntilTerminate(listener, handler)
+	return listener, nil
 }
 
-func ListenAndServeTLS(addr string, cert, key string, handler http.Handler) error {
+func ListenTLS(cert, key, addr string) (net.Listener, error) {
 	listener, err := ListenReusable("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	certificate, err := tls.X509KeyPair([]byte(cert), []byte(key))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	tlsConfig := &tls.Config{
@@ -44,14 +42,10 @@ func ListenAndServeTLS(addr string, cert, key string, handler http.Handler) erro
 		MinVersion:               tls.VersionTLS10,
 	}
 
-	return serveUntilTerminate(tls.NewListener(listener, tlsConfig), handler)
+	return tls.NewListener(listener, tlsConfig), nil
 }
 
-func serveUntilTerminate(listener net.Listener, handler http.Handler) error {
-	// https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
-	// writeTimeout is different with HTTPS so use 60 seconds instead of 30
-	server := &http.Server{Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second}
-
+func ServeUntilTerminate(server *http.Server, listener net.Listener) error {
 	sigterm := make(chan os.Signal, 1)
 	signal.Notify(sigterm, syscall.SIGTERM)
 
@@ -66,8 +60,9 @@ func serveUntilTerminate(listener net.Listener, handler http.Handler) error {
 	case <-sigterm:
 		// on SIGTERM, close the listener
 		// disable keep alives so that new requests cannot be made after listeners are closed
+		// maybe checkout https://beta.golang.org/doc/go1.8#http_shutdown
 		server.SetKeepAlivesEnabled(false)
-		// closing the listener will cause a server error
+		// closing the listener will cause a server error, but we're going to return right now so we'll never see it
 		listener.Close()
 		return nil
 	case err := <-serverError:

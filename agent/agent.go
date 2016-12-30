@@ -20,14 +20,13 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc/grpclog"
-
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/logging"
 	"cloud.google.com/go/pubsub"
 	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
+	"google.golang.org/grpc/grpclog"
 )
 
 const (
@@ -46,6 +45,12 @@ func _log(severity logging.Severity, prefix string, message string, labels map[s
 	if strings.HasPrefix(message, "http: TLS handshake error from ") {
 		// there's a bunch of these caused by HTTPS port scanners, so just discard these in production
 		// https://groups.google.com/forum/#!topic/golang-nuts/d4sjZR7H4gU
+		return
+	}
+
+	if strings.Contains(message, "transport: http2Client.notifyError got notified that the client transport was broken EOF.") {
+		// this happens every 4 minutes due to inactivity, the log message appears pointless
+		// https://github.com/GoogleCloudPlatform/google-cloud-go/issues/293
 		return
 	}
 
@@ -341,12 +346,14 @@ func startVersion(version int) (*AppProcess, error) {
 	cmd.Dir = "/tmp"
 	cmd.Env = environment
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: appUID, Gid: appUID},
-		// Pdeathsig should be set so that if the agent dies, it can restart the child process
-		// without it, the child process will still be running and no longer monitored by the agent
-		// Pdeathsig: syscall.SIGKILL,
-		// this doesn't work since we use setcap on the executable
+	if !app.Debug {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: appUID, Gid: appUID},
+			// Pdeathsig should be set so that if the agent dies, it can restart the child process
+			// without it, the child process will still be running and no longer monitored by the agent
+			// Pdeathsig: syscall.SIGKILL,
+			// this doesn't work since we use setcap on the executable
+		}
 	}
 
 	ap := &AppProcess{
@@ -370,12 +377,6 @@ func startVersion(version int) (*AppProcess, error) {
 
 	infof("running app")
 
-	labels := map[string]string{
-		// secondary_key doesn't seem to work correctly, might be a bug
-		"custom.googleapis.com/secondary_key": versionName,
-		"version": versionName,
-	}
-
 	// we need a goroutine to wait for the process to exit
 	go func() {
 		// create a goroutine for each pipe to read from the output until complete
@@ -385,7 +386,7 @@ func startVersion(version int) (*AppProcess, error) {
 			defer wg.Done()
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				_log(logging.Info, appName, scanner.Text(), labels)
+				_log(logging.Info, appName, scanner.Text(), nil)
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -402,7 +403,7 @@ func startVersion(version int) (*AppProcess, error) {
 					// the debugger takes stdout from the child process and reroutes it to stderr
 					level = logging.Info
 				}
-				_log(level, appName, scanner.Text(), labels)
+				_log(level, appName, scanner.Text(), nil)
 			}
 			if err := scanner.Err(); err != nil {
 				errorf("error reading from child process err=%v", err)
@@ -479,14 +480,9 @@ func main() {
 	loggingClient, err := logging.NewClient(c, project)
 	V(err)
 
-	commonLabels := map[string]string{
-		// special keys for filtering in the cloud console log viewer
-		"custom.googleapis.com/primary_key": appName,
-		"app":      appName,
-		"instance": instance,
-	}
-	logger = loggingClient.Logger("engineer", logging.CommonLabels(commonLabels))
+	logger = loggingClient.Logger("engineer")
 
+	// convert grpc logs to cloud logs
 	grpclog.SetLogger(&LogConverter{logger})
 
 	pubsubClient, err = pubsub.NewClient(c, project)
@@ -547,7 +543,7 @@ func main() {
 				}
 
 				if m.Published.Add(60 * time.Second).Before(time.Now()) {
-					infof("dropping old message")
+					infof("dropping expired message")
 					continue
 				}
 
@@ -555,7 +551,7 @@ func main() {
 					resp.RequestID = m.RequestID
 					resp.Instance = instance
 					if err := internal.SendMessage(c, resp, topic); err != nil {
-						errorf("send error=%v", err)
+						errorf("message send error=%v", err)
 					}
 				}
 
@@ -596,7 +592,7 @@ func main() {
 
 		go func() {
 			for {
-				errorf("message error=%v", processMessages())
+				errorf("process messages error=%v", processMessages())
 				time.Sleep(1 * time.Minute)
 			}
 		}()
@@ -654,7 +650,7 @@ func main() {
 			statusMutex.Unlock()
 			select {
 			case <-shutdown:
-				// machine is shutting down, exit, killing the child app
+				// machine is shutting down SIGTERM the child process and then exit
 				statusMutex.Lock()
 				offline = true
 				statusMutex.Unlock()
