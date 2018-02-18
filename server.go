@@ -7,42 +7,60 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
-func Listen(addr string) (net.Listener, error) {
+func NewServer(addr string) (*http.Server, net.Listener, error) {
+	server := &http.Server{ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
 	listener, err := ListenReusable("tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return listener, nil
+	return server, listener, nil
 }
 
-func ListenTLS(cert, key, addr string) (net.Listener, error) {
-	listener, err := ListenReusable("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
+func NewServerTLS(addr, cert, key string) (*http.Server, net.Listener, error) {
 	certificate, err := tls.X509KeyPair([]byte(cert), []byte(key))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	tlsConfig := &tls.Config{
+	// https://blog.gopheracademy.com/advent-2016/exposing-go-on-the-internet/
+	config := &tls.Config{
+		// no need to have http/2 yet, not sure what it would offer for current use case
+		// NextProtos:   []string{"h2", "http/1.1"},
 		NextProtos:   []string{"http/1.1"},
 		Certificates: []tls.Certificate{certificate},
-		// based on https://github.com/cloudflare/sslconfig/blob/master/conf
+		// Causes servers to use Go's default ciphersuite preferences,
+		// which are tuned to avoid attacks. Does nothing on clients.
+		PreferServerCipherSuites: true,
+		// Only use curves which have assembly implementations
+		CurvePreferences: []tls.CurveID{
+			tls.CurveP256,
+			tls.X25519, // Go 1.8 only
+		},
+		MinVersion: tls.VersionTLS10,
 		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, // Go 1.8 only
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,   // Go 1.8 only
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+
+			// Best disabled, as they don't provide Forward Secrecy,
+			// but might be necessary for some clients
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
 		},
-		PreferServerCipherSuites: true,
-		MinVersion:               tls.VersionTLS10,
 	}
 
-	return tls.NewListener(listener, tlsConfig), nil
+	server, listener, err := NewServer(addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	listener = tls.NewListener(listener, config)
+	return server, listener, nil
 }
 
 func ServeUntilTerminate(server *http.Server, listener net.Listener) error {

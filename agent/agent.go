@@ -26,6 +26,8 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/pushbullet/engineer/internal"
 	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
 )
 
@@ -480,7 +482,7 @@ func main() {
 	loggingClient, err := logging.NewClient(c, project)
 	V(err)
 
-	logger = loggingClient.Logger("engineer")
+	logger = loggingClient.Logger(appName)
 
 	// convert grpc logs to cloud logs
 	grpclog.SetLogger(&LogConverter{logger})
@@ -508,7 +510,7 @@ func main() {
 		var running bool
 		var offline bool
 
-		processMessages := func() error {
+		processMessages := func(c context.Context) error {
 			topic := internal.TopicFromAppName(pubsubClient, appName)
 			sub := pubsubClient.Subscription(instance)
 
@@ -592,8 +594,13 @@ func main() {
 
 		go func() {
 			for {
-				errorf("process messages error=%v", processMessages())
-				time.Sleep(1 * time.Minute)
+				// there seems to be an issue with the it.Next() command hanging forever
+				// possibly a dead connection, use a deadline to prevent that from happening
+				tc, _ := context.WithTimeout(c, 10*time.Minute)
+				if err := processMessages(tc); grpc.Code(err) != codes.DeadlineExceeded && err != context.DeadlineExceeded {
+					errorf("process messages error=%v", err)
+					time.Sleep(1 * time.Minute)
+				}
 			}
 		}()
 

@@ -11,7 +11,8 @@ import (
 func main() {
 	fmt.Println("started")
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		cats := os.Getenv("cats")
 		if cats == "" {
 			cats = "<unset>"
@@ -19,13 +20,20 @@ func main() {
 		fmt.Fprintf(w, "Engineer example app!\nCurrent cats level: %+v\n", cats)
 	})
 
+	var addr string
 	if engineer.Development() {
-		if err := http.ListenAndServe("127.0.0.1:8080", nil); err != nil {
-			panic(err)
-		}
+		addr = "127.0.0.1:8080"
 	} else {
-		if err := http.ListenAndServe(":80", nil); err != nil {
-			panic(err)
-		}
+		addr = ":80"
+	}
+
+	server, listener, err := engineer.NewServer(addr)
+	if err != nil {
+		panic(err)
+	}
+
+	server.Handler = mux
+	if err := engineer.ServeUntilTerminate(server, listener); err != nil {
+		panic(err)
 	}
 }

@@ -390,6 +390,7 @@ func createInstanceGroup(app internal.App, version int, singleton bool) {
 					Network: "global/networks/default",
 					AccessConfigs: []*compute.AccessConfig{
 						{
+							Type: "ONE_TO_ONE_NAT",
 							Name: "External NAT",
 						},
 					},
