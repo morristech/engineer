@@ -56,7 +56,7 @@ func main() {
 	imageName := "engr-image-" + time.Now().Format("20060102t150405")
 
 	baseImageURL := ""
-	imageList, err := gce.Images.List("debian-cloud").Filter("name eq 'debian-8-.*'").Do()
+	imageList, err := gce.Images.List("debian-cloud").Filter("name eq 'debian-9-.*'").Do()
 	V(err)
 	for _, image := range imageList.Items {
 		if image.Deprecated != nil {
