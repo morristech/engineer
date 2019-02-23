@@ -29,6 +29,7 @@ const (
 	imageScript = `
 sudo apt-get update
 sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes --force-yes
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes libcap2-bin
 `
 	zone = "us-central1-c"
 )
