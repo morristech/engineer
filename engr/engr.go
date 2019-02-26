@@ -305,6 +305,9 @@ func serve(app internal.App) {
 			if f.Name() == "pkg" {
 				return filepath.SkipDir
 			}
+			if f.Name() == "bin" {
+				return filepath.SkipDir
+			}
 		}
 
 		watcher.Add(path)
