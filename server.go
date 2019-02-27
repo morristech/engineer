@@ -39,7 +39,7 @@ func NewServerTLS(addr, cert, key string) (*http.Server, net.Listener, error) {
 			tls.CurveP256,
 			tls.X25519, // Go 1.8 only
 		},
-		MinVersion: tls.VersionTLS10,
+		MinVersion: tls.VersionTLS12,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
